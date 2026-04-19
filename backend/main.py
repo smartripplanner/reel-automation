@@ -12,18 +12,27 @@ from services.scheduler import start_scheduler, stop_scheduler
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    # Database initialisation
-    init_db()
+    # ── Database ────────────────────────────────────────────────────────────────
+    try:
+        init_db()
+    except Exception as exc:  # noqa: BLE001
+        print(f"[Startup] WARNING: DB init failed — {exc}")
 
-    # Auto-scheduler: triggers the pipeline 3× daily (09:00, 14:00, 19:00 UTC)
-    # with a random South East Asia sub-topic.  Runs in a daemon background thread
-    # so it never blocks the FastAPI event loop.
-    start_scheduler()
+    # ── Scheduler ───────────────────────────────────────────────────────────────
+    # Wrapped in try/except so a broken APScheduler install or import never
+    # prevents the FastAPI server from starting (CORS headers must reach clients).
+    try:
+        start_scheduler()
+    except Exception as exc:  # noqa: BLE001
+        print(f"[Startup] WARNING: Scheduler failed to start — {exc}")
 
     yield  # ── app is running ──
 
-    # Graceful shutdown: stop APScheduler before process exits
-    stop_scheduler()
+    # ── Graceful shutdown ───────────────────────────────────────────────────────
+    try:
+        stop_scheduler()
+    except Exception:  # noqa: BLE001
+        pass
 
 
 app = FastAPI(title="Reel Automation Dashboard API", lifespan=lifespan)
@@ -40,14 +49,14 @@ _CORS_ORIGINS = [
     "http://127.0.0.1:5173",
     # Production — Netlify frontend
     "https://bejewelled-hotteok-26a68c.netlify.app",
-    # Any additional origins injected via env var
+    # Any additional origins injected via CORS_ORIGIN env var (comma-separated)
     *_extra,
 ]
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=_CORS_ORIGINS,
-    allow_credentials=True,
+    allow_origins=["*"],        # permissive during debug — tighten to _CORS_ORIGINS after confirming backend is up
+    allow_credentials=False,    # must be False when allow_origins=["*"]
     allow_methods=["*"],
     allow_headers=["*"],
 )
