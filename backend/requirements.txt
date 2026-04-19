@@ -1,0 +1,49 @@
+# ── Web framework ──────────────────────────────────────────────────────────
+fastapi==0.115.12
+uvicorn[standard]==0.34.1
+
+# ── Database / validation ──────────────────────────────────────────────────
+sqlalchemy==2.0.40
+pydantic==2.11.3
+
+# ── HTTP ───────────────────────────────────────────────────────────────────
+requests==2.32.3
+
+# ── Video / audio processing ───────────────────────────────────────────────
+moviepy==1.0.3          # kept as fallback renderer; FFmpeg is primary
+Pillow>=10.0.0          # hook screen rendering
+
+# ── Text-to-speech ─────────────────────────────────────────────────────────
+# PRIMARY: ElevenLabs — eleven_multilingual_v2, Hinglish-capable
+elevenlabs>=1.0.0
+
+# FALLBACK 1: edge-tts — Microsoft neural voices, free, no API key
+edge-tts>=6.1.12
+
+# FALLBACK 2: gTTS — robotic but always available
+gTTS==2.5.4
+
+# ── Word-level caption synchronisation ────────────────────────────────────
+# faster-whisper — local Whisper inference, tiny model (~75 MB)
+# Downloads model on first run to backend/storage/models/
+# Remove this line if you prefer estimated timing (no 75 MB download)
+faster-whisper>=1.0.3
+
+# ── Scheduling ─────────────────────────────────────────────────────────────
+apscheduler>=3.10.0     # BackgroundScheduler — triggers pipeline 3×/day automatically
+
+# ── Cloud storage ───────────────────────────────────────────────────────────
+boto3>=1.34.0           # AWS S3 upload for the Cloud Bridge
+
+# ── Utilities ──────────────────────────────────────────────────────────────
+python-dotenv==1.0.1
+numpy>=1.24.0
+
+# ── FFmpeg (system dependency — NOT a pip package) ─────────────────────────
+# Install FFmpeg separately:
+#   Windows: winget install ffmpeg   OR   choco install ffmpeg
+#   macOS:   brew install ffmpeg
+#   Ubuntu:  sudo apt install ffmpeg
+#
+# After install, verify: ffmpeg -version
+# The video engine auto-detects FFmpeg on PATH and falls back to MoviePy if absent.

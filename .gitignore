@@ -1,0 +1,39 @@
+# ── Secrets — NEVER commit these ──────────────────────────────────────────────
+.env
+backend/.env
+*.env
+
+# ── Python ────────────────────────────────────────────────────────────────────
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.pycache
+.Python
+
+# ── Virtual environments ───────────────────────────────────────────────────────
+venv/
+.venv/
+env/
+ENV/
+
+# ── Generated media & storage ─────────────────────────────────────────────────
+*.mp4
+*.mp3
+*.wav
+storage/
+logs/
+
+# ── Frontend build artifacts ───────────────────────────────────────────────────
+frontend/node_modules/
+frontend/dist/
+frontend/.env
+
+# ── IDE / OS ───────────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# ── Claude Code session files ─────────────────────────────────────────────────
+.claude/

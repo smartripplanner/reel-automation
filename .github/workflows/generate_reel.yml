@@ -1,0 +1,130 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# generate_reel.yml — GitHub Actions Reel Generation Worker
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# Architecture
+# ────────────
+# FastAPI on Render   = Brain  (scheduler, API, dashboard)
+# GitHub Actions      = Muscle (FFmpeg rendering, S3 upload, IG posting)
+#
+# Trigger
+# ───────
+# workflow_dispatch — called by FastAPI via POST to GitHub REST API:
+#   POST /repos/{owner}/{repo}/actions/workflows/generate_reel.yml/dispatches
+#   Body: { "ref": "main", "inputs": { "topic": "..." } }
+#
+# Required GitHub Secrets (Settings → Secrets → Actions)
+# ────────────────────────────────────────────────────────
+#   GEMINI_API_KEY        — Gemini 2.5 Flash (primary LLM)
+#   GEMINI_MODEL          — e.g., models/gemini-2.5-flash
+#   GROQ_API_KEY          — Groq fallback LLM
+#   OPENAI_API_KEY        — Optional OpenAI fallback
+#   APIFY_API_TOKEN       — Apify trend scraper (optional)
+#   PEXELS_API_KEY        — Scene clip downloads
+#   ELEVENLABS_API_KEY    — ElevenLabs TTS
+#   ELEVENLABS_VOICE_ID   — ElevenLabs voice ID
+#   AWS_ACCESS_KEY_ID     — S3 upload credentials
+#   AWS_SECRET_ACCESS_KEY — S3 upload credentials
+#   AWS_BUCKET_NAME       — S3 bucket name
+#   AWS_REGION            — S3 region (e.g. ap-south-1)
+#   IG_USER_ID            — Instagram numeric Business/Creator ID
+#   IG_ACCESS_TOKEN       — Instagram Graph API long-lived page token
+# ─────────────────────────────────────────────────────────────────────────────
+
+name: Generate Instagram Reel
+
+on:
+  workflow_dispatch:
+    inputs:
+      topic:
+        description: 'Reel topic (e.g., "Hidden Gems in Europe — budget tips")'
+        required: true
+        type: string
+
+jobs:
+  generate-reel:
+    name: "Render & Publish: ${{ github.event.inputs.topic }}"
+    runs-on: ubuntu-latest
+
+    # Full pipeline: script(10s) + TTS(10s) + Pexels(30s) + Whisper(30s)
+    # + FFmpeg(90s) + S3(15s) + Instagram poll(90s) = ~5 min typical.
+    # 30-minute cap gives 6× headroom for slow Pexels / large 4K clips.
+    timeout-minutes: 30
+
+    steps:
+      # ── 1. Source code ──────────────────────────────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ── 2. Python runtime ───────────────────────────────────────────────────
+      - name: Set up Python 3.10
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+          cache: "pip"
+          cache-dependency-path: backend/requirements.txt
+
+      # ── 3. System dependencies ──────────────────────────────────────────────
+      # FFmpeg is the primary renderer (libx264, yuv420p, bt709 colour space).
+      # Ubuntu's apt package is recent enough for all required flags.
+      - name: Install FFmpeg
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends ffmpeg
+          ffmpeg -version | head -1   # confirm install
+
+      # ── 4. Python dependencies ──────────────────────────────────────────────
+      - name: Install Python requirements
+        working-directory: backend
+        run: pip install -r requirements.txt
+
+      # ── 5. Whisper model cache ──────────────────────────────────────────────
+      # faster-whisper downloads the tiny model (~75 MB) on first run into
+      # backend/storage/models/. Caching it avoids a 30-second cold-download
+      # on every workflow run.
+      - name: Cache Whisper tiny model
+        uses: actions/cache@v4
+        with:
+          path: backend/storage/models
+          key: whisper-tiny-model-v1
+          restore-keys: whisper-tiny-model-
+
+      # ── 6. Run the worker ───────────────────────────────────────────────────
+      # All pipeline stages run here: LLM → TTS → Pexels → FFmpeg → S3 → IG.
+      # Exit code 1 marks the step (and job) as failed in the Actions UI.
+      - name: Generate reel
+        working-directory: backend
+        run: python github_worker.py --topic "${{ github.event.inputs.topic }}"
+        env:
+          # ── LLM / Script generation ────────────────────────────────────────
+          GEMINI_API_KEY:        ${{ secrets.GEMINI_API_KEY }}
+          GEMINI_MODEL:          ${{ secrets.GEMINI_MODEL }}
+          GROQ_API_KEY:          ${{ secrets.GROQ_API_KEY }}
+          OPENAI_API_KEY:        ${{ secrets.OPENAI_API_KEY }}
+          # ── Trend scraping (optional) ───────────────────────────────────────
+          APIFY_API_TOKEN:       ${{ secrets.APIFY_API_TOKEN }}
+          # ── Media fetch ────────────────────────────────────────────────────
+          PEXELS_API_KEY:        ${{ secrets.PEXELS_API_KEY }}
+          # ── Text-to-speech ─────────────────────────────────────────────────
+          ELEVENLABS_API_KEY:    ${{ secrets.ELEVENLABS_API_KEY }}
+          ELEVENLABS_VOICE_ID:   ${{ secrets.ELEVENLABS_VOICE_ID }}
+          # ── AWS S3 Cloud Bridge ────────────────────────────────────────────
+          AWS_ACCESS_KEY_ID:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_BUCKET_NAME:       ${{ secrets.AWS_BUCKET_NAME }}
+          AWS_REGION:            ${{ secrets.AWS_REGION }}
+          # ── Instagram Graph API ────────────────────────────────────────────
+          IG_USER_ID:            ${{ secrets.IG_USER_ID }}
+          IG_ACCESS_TOKEN:       ${{ secrets.IG_ACCESS_TOKEN }}
+
+      # ── 7. Upload rendered reel as artifact (optional, 1-day retention) ─────
+      # Useful for debugging failed Instagram uploads — download the .mp4
+      # directly from the Actions run summary page.
+      - name: Upload reel artifact
+        if: always()   # upload even if the IG post step failed
+        uses: actions/upload-artifact@v4
+        with:
+          name: "reel-${{ github.run_id }}"
+          path: backend/storage/reels/*.mp4
+          retention-days: 1
+          if-no-files-found: ignore
