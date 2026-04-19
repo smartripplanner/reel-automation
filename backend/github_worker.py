@@ -42,6 +42,8 @@ import os
 import sys
 from pathlib import Path
 
+import requests
+
 # ── Ensure backend/ is on sys.path ────────────────────────────────────────────
 # Works whether invoked as:
 #   cd backend && python github_worker.py           (SCRIPT_DIR already in path)
@@ -60,6 +62,41 @@ load_dotenv(SCRIPT_DIR / ".env", override=False)  # don't overwrite real env var
 
 # ── Pipeline import (after path + dotenv are set up) ─────────────────────────
 from automation.main_pipeline import run_pipeline  # noqa: E402
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# GitHub Actions Trigger — importable by FastAPI routes
+# ─────────────────────────────────────────────────────────────────────────────
+
+_GITHUB_TOKEN = os.getenv("GITHUB_PAT")
+_GITHUB_REPO  = os.getenv("GITHUB_REPO")
+
+
+def trigger_github_workflow(topic: str) -> tuple[int, str]:
+    """
+    Fire a workflow_dispatch event on generate_reel.yml for the given topic.
+
+    Returns
+    -------
+    (status_code, response_text)
+        204 = workflow queued successfully
+        4xx = auth / config error (check GITHUB_PAT and GITHUB_REPO env vars)
+    """
+    url = (
+        f"https://api.github.com/repos/{_GITHUB_REPO}"
+        f"/actions/workflows/generate_reel.yml/dispatches"
+    )
+    headers = {
+        "Authorization": f"Bearer {_GITHUB_TOKEN}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    payload = {
+        "ref": os.getenv("GITHUB_BRANCH", "main"),
+        "inputs": {"topic": topic},
+    }
+    resp = requests.post(url, headers=headers, json=payload, timeout=15)
+    return resp.status_code, resp.text
 
 
 # ─────────────────────────────────────────────────────────────────────────────

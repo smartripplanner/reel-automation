@@ -1,7 +1,11 @@
+import logging
+
 from fastapi import APIRouter, BackgroundTasks, Depends
+from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from database import get_db
+from github_worker import trigger_github_workflow
 from schemas import (
     AutomationStatusResponse,
     BatchGenerateRequest,
@@ -19,6 +23,14 @@ from services.automation_service import (
     stop_automation,
     trigger_sequential_batch,
 )
+from services.job_tracker import create_job, get_all_jobs, update_job
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+
+class GenerateRequest(BaseModel):
+    topic: str
 
 router = APIRouter(prefix="/automation", tags=["automation"])
 
@@ -76,10 +88,37 @@ async def generate_reel_async_single_route(
     return run_generate_job(background_tasks, db)
 
 
-@router.post("/generate", response_model=GenerateReelResponse)
-async def generate_reel_route(db: Session = Depends(get_db)):
-    """Synchronous generate — kept for backwards compatibility."""
-    return generate_reel(db)
+@router.post("/generate")
+def generate_reel_route(req: GenerateRequest):
+    """
+    Trigger a single reel via GitHub Actions and return a job tracking ID.
+
+    Creates an in-memory job record, dispatches a workflow_dispatch event to
+    GitHub Actions (the Muscle), and immediately returns — no blocking wait.
+    Poll GET /automation/jobs to see status for all triggered jobs.
+    """
+    job = create_job(req.topic)
+    logger.info(f"[Job {job['id']}] Created for topic: {req.topic!r}")
+
+    status_code, response_text = trigger_github_workflow(req.topic)
+
+    if status_code == 204:
+        update_job(job["id"], "running")
+        logger.info(f"[Job {job['id']}] GitHub workflow queued successfully")
+    else:
+        update_job(job["id"], "failed")
+        logger.error(
+            f"[Job {job['id']}] GitHub workflow trigger failed "
+            f"(HTTP {status_code}): {response_text}"
+        )
+
+    return {"job_id": job["id"], "status": job["status"]}
+
+
+@router.get("/jobs")
+def list_jobs():
+    """Return all in-memory job records (id, topic, status, created_at)."""
+    return get_all_jobs()
 
 
 @router.post("/generate-batch", response_model=BatchGenerateResponse)
