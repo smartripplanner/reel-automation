@@ -5,6 +5,7 @@ import Settings from "./pages/Settings";
 import { useJobPoller } from "./hooks/useJobPoller";
 import {
   generateBatchReels,
+  generateReel,
   generateReelJob,
   getAutomationStatus,
   getLogs,
@@ -73,7 +74,7 @@ function App() {
 
   useEffect(() => {
     refreshData().catch(() => {
-      setError("Unable to reach the backend. Start FastAPI on port 8000 and refresh.");
+      setError("Unable to reach the backend. Check that VITE_API_URL is set correctly and the backend is running.");
     });
   }, []);
 
@@ -99,18 +100,27 @@ function App() {
     }
   };
 
-  // Async generate — returns job_id immediately, polls until done
+  // Generate a single reel — dispatches to GitHub Actions, returns job_id instantly
   const handleGenerate = async () => {
     setBusy(true);
     setError("");
     clearJob();
+    setBatchProgress("Starting...");
 
     try {
-      const { job_id } = await generateReelJob();
-      startJob(job_id);
-      // busy stays true until the useEffect above sees terminal status
+      const data = await generateReel("Hidden gems in Europe");
+      const jobId = data.job_id ?? "unknown";
+      const jobStatus = data.status ?? "queued";
+
+      setBatchProgress(`Job ${jobStatus} — ID: ${jobId}`);
+      console.log("Generate response:", data);
+
+      // Clear the progress banner after 8 s so it doesn't linger
+      window.setTimeout(() => setBatchProgress(""), 8000);
     } catch (requestError) {
       setError(extractErrorMessage(requestError, "Failed to start generation."));
+      setBatchProgress("");
+    } finally {
       setBusy(false);
     }
   };

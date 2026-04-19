@@ -1,8 +1,8 @@
 import axios from "axios";
 
-// In production (Render/Vercel), set REACT_APP_API_URL in the hosting env.
-// In local dev, it falls back to the Vite dev server proxy target.
-const API_BASE = process.env.REACT_APP_API_URL || "http://127.0.0.1:8000";
+// Vite exposes env vars via import.meta.env (not process.env).
+// Set VITE_API_URL in frontend/.env (local) or the hosting dashboard (prod).
+const API_BASE = import.meta.env.VITE_API_URL || "http://127.0.0.1:8000";
 
 const api = axios.create({
   baseURL: API_BASE,
@@ -23,8 +23,10 @@ export const stopAutomation = async () => {
   return data;
 };
 
-export const generateReel = async () => {
-  const { data } = await api.post("/automation/generate");
+// Trigger a single reel via GitHub Actions.
+// Returns { job_id, status } from the in-memory job tracker.
+export const generateReel = async (topic = "Travel Tips & Hidden Gems") => {
+  const { data } = await api.post("/automation/generate", { topic });
   return data;
 };
 
@@ -53,7 +55,7 @@ export const updateSettings = async (payload) => {
   return data;
 };
 
-// ── Async reel generation (job-based) ────────────────────────────────────────
+// ── Async reel generation (job-based, DB-backed) ─────────────────────────────
 
 export const generateReelJob = async () => {
   const { data } = await api.post("/automation/generate-async");
