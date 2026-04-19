@@ -1,7 +1,11 @@
 import axios from "axios";
 
+// In production (Render/Vercel), set REACT_APP_API_URL in the hosting env.
+// In local dev, it falls back to the Vite dev server proxy target.
+const API_BASE = process.env.REACT_APP_API_URL || "http://127.0.0.1:8000";
+
 const api = axios.create({
-  baseURL: "http://127.0.0.1:8000",
+  baseURL: API_BASE,
 });
 
 export const getAutomationStatus = async () => {

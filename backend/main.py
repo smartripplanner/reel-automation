@@ -27,9 +27,19 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(title="Reel Automation Dashboard API", lifespan=lifespan)
 
+import os as _os
+
+_CORS_ORIGINS = [
+    # Local development
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
+    # Production — add your frontend Render/Vercel URL here (or set CORS_ORIGIN env var)
+    *([_os.getenv("CORS_ORIGIN")] if _os.getenv("CORS_ORIGIN") else []),
+]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
+    allow_origins=_CORS_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
