@@ -1,6 +1,4 @@
 import logging
-import threading
-import time
 
 from fastapi import APIRouter, BackgroundTasks, Depends
 from pydantic import BaseModel
@@ -35,69 +33,36 @@ class GenerateRequest(BaseModel):
     topic: str
 
 
-# ── Queued batch dispatcher ────────────────────────────────────────────────────
-
-# Delays between each reel dispatch: job 1 fires immediately,
-# job 2 after 15 min, job 3 after another 15 min (30 min total elapsed).
-_BATCH_DELAYS = [0, 900, 1800]  # seconds
-
-
-def _queue_batch_jobs(topic: str) -> None:
-    """
-    Fire 3 GitHub Actions workflows for the same topic with staggered delays.
-    Runs on a daemon thread — never blocks the request/event loop.
-    """
-    for i, delay in enumerate(_BATCH_DELAYS, start=1):
-        logger.info(f"[Queue] Job {i}/3 — waiting {delay}s before dispatch (topic: {topic!r})")
-        time.sleep(delay)
-
-        job = create_job(topic)
-        logger.info(f"[Queue] Job {i}/3 — dispatching to GitHub Actions (job_id={job['id']})")
-
-        status_code, response_text = trigger_github_workflow(topic)
-
-        if status_code == 204:
-            update_job(job["id"], "running")
-            logger.info(f"[Queue] Job {i}/3 — workflow queued (job_id={job['id']})")
-        else:
-            update_job(job["id"], "failed")
-            logger.error(
-                f"[Queue] Job {i}/3 — dispatch failed (HTTP {status_code}): {response_text}"
-            )
-
 router = APIRouter(prefix="/automation", tags=["automation"])
 
 
 @router.post("/start")
 def start_automation_route(db: Session = Depends(get_db)):
     """
-    Non-blocking queued batch trigger.
+    Trigger a single reel via GitHub Actions using the saved niche as topic.
 
-    Reads the current niche from DB settings and dispatches 3 GitHub Actions
-    workflows — immediately, after 15 min, and after 30 min — on a daemon
-    thread.  Returns instantly with a confirmation payload so the UI stays
-    responsive.  Poll GET /automation/jobs for per-dispatch status.
+    Reads niche from DB settings, creates one in-memory job record, dispatches
+    one workflow_dispatch event to GitHub Actions, and returns immediately.
+    Poll GET /automation/jobs to check status.
     """
     from models import Settings as SettingsModel  # local import avoids circular dep
 
     row = db.query(SettingsModel).first()
     topic = row.niche if row and row.niche else "Travel Tips & Hidden Gems"
 
-    thread = threading.Thread(
-        target=_queue_batch_jobs,
-        args=(topic,),
-        daemon=True,
-        name="reel-batch-queue",
-    )
-    thread.start()
+    job = create_job(topic)
+    logger.info(f"[Start] Dispatching 1 reel to GitHub Actions — topic: {topic!r}, job_id: {job['id']}")
 
-    logger.info(f"[Start] Batch queue started for topic: {topic!r}")
-    return {
-        "status": "Batch queued",
-        "topic": topic,
-        "jobs": 3,
-        "schedule": "0 min / 15 min / 30 min",
-    }
+    status_code, response_text = trigger_github_workflow(topic)
+
+    if status_code == 204:
+        update_job(job["id"], "running")
+        logger.info(f"[Start] Workflow queued (job_id={job['id']})")
+    else:
+        update_job(job["id"], "failed")
+        logger.error(f"[Start] Dispatch failed (HTTP {status_code}): {response_text}")
+
+    return {"status": job["status"], "topic": topic, "job_id": job["id"]}
 
 
 @router.post("/stop", response_model=AutomationStatusResponse)
