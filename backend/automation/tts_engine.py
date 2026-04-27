@@ -32,6 +32,7 @@ from pathlib import Path
 import numpy as np
 from dotenv import load_dotenv
 
+from automation.hinglish_converter import convert_to_devanagari
 from utils.storage import AUDIO_DIR, BASE_DIR, ensure_storage_dirs, to_storage_relative
 
 load_dotenv()
@@ -222,10 +223,18 @@ def _elevenlabs_tts(text: str, output_path: Path, log_handler=None) -> bool:
     try:
         client = ElevenLabs(api_key=api_key)
 
-        # Apply pronunciation map: swap tricky Hinglish tokens for phonetic
-        # equivalents before sending to ElevenLabs.  Subtitles are generated
-        # from the original text upstream — this change is audio-only.
-        tts_text = _apply_pronunciation_map(text)
+        # Stage 1 — Devanagari conversion: replace Roman Hindi words with
+        # Devanagari script so eleven_multilingual_v2 reads them natively.
+        # e.g. "yaar" → "यार", "mein" → "में", "bhai" → "भाई"
+        # ElevenLabs reads Devanagari with perfect Hindi pronunciation;
+        # Roman Hindi requires guessing and often produces wrong accents.
+        # Subtitles upstream always use the original Roman text — audio only.
+        tts_text = convert_to_devanagari(text)
+
+        # Stage 2 — Pronunciation map: phonetic fixes for any remaining
+        # Roman tokens not covered by Devanagari (place names, English words
+        # that get a British accent, Gen-Z shorthands the LLM sneaks through).
+        tts_text = _apply_pronunciation_map(tts_text)
 
         # ── Stability log: show exactly what ElevenLabs will receive ──────────
         _log(log_handler,
