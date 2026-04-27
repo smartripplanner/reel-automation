@@ -1,10 +1,22 @@
 import os
+
+# Suppress ONNX Runtime GPU-discovery warning on CPU-only servers (Render free tier).
+# Must be set before any onnxruntime / faster-whisper import.
+os.environ.setdefault("ORT_LOGGING_LEVEL", "3")          # ERROR level only
+os.environ.setdefault("ORT_DISABLE_ALL_LOGGING", "1")    # belt-and-suspenders
+
+# Suppress HuggingFace Hub unauthenticated-request warning when HF_TOKEN is absent.
+# The model still downloads fine; this just removes the noisy stderr line.
+os.environ.setdefault("HF_HUB_DISABLE_IMPLICIT_TOKEN", "1")
+
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 
 from database import init_db
+import models  # noqa: F401 — registers ALL ORM models (incl. Job) with Base.metadata
 from routes import automation, jobs, logs, reels, settings
 from schemas import HealthResponse, RootResponse
 
@@ -13,9 +25,22 @@ from schemas import HealthResponse, RootResponse
 async def lifespan(_: FastAPI):
     # ── Database ────────────────────────────────────────────────────────────────
     try:
+        # init_db() creates all tables including the new "jobs" table
         init_db()
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         print(f"[Startup] WARNING: DB init failed — {exc}")
+
+    # ── Job recovery ────────────────────────────────────────────────────────────
+    # Any job still "running" or "queued" from the previous process is now
+    # unreachable (background thread gone). Mark them failed so the frontend
+    # stops polling with 404s and shows a clear error message instead.
+    try:
+        from services.job_service import recover_stale_jobs
+        recovered = recover_stale_jobs()
+        if recovered:
+            print(f"[Startup] Recovered {recovered} stale job(s) → marked as failed")
+    except Exception as exc:
+        print(f"[Startup] WARNING: Job recovery failed — {exc}")
 
     yield  # ── app is running ──
 
@@ -23,25 +48,19 @@ async def lifespan(_: FastAPI):
 app = FastAPI(title="Reel Automation Dashboard API", lifespan=lifespan)
 
 # ── CORS ──────────────────────────────────────────────────────────────────────
-# Must be registered BEFORE any app.include_router() calls.
-# Add extra origins via the CORS_ORIGIN env var (comma-separated) so new
-# domains can be whitelisted on Render without a code change.
 _extra = [o.strip() for o in os.getenv("CORS_ORIGIN", "").split(",") if o.strip()]
 
 _CORS_ORIGINS = [
-    # Local development
     "http://localhost:5173",
     "http://127.0.0.1:5173",
-    # Production — Netlify frontend
     "https://bejewelled-hotteok-26a68c.netlify.app",
-    # Any additional origins injected via CORS_ORIGIN env var (comma-separated)
     *_extra,
 ]
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],        # permissive during debug — tighten to _CORS_ORIGINS after confirming backend is up
-    allow_credentials=False,    # must be False when allow_origins=["*"]
+    allow_origins=["*"],        # tighten to _CORS_ORIGINS once backend is confirmed stable
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -53,7 +72,11 @@ app.include_router(settings.router)
 app.include_router(logs.router)
 
 
-@app.get("/", response_model=RootResponse)
+# ── Root — supports both GET and HEAD ─────────────────────────────────────────
+# Render's health check probes HEAD / on startup; without an explicit HEAD
+# handler FastAPI returns 405, which fails the health check and prevents the
+# service from being marked "live". Both methods return the same JSON body.
+@app.api_route("/", methods=["GET", "HEAD"])
 async def root():
     return RootResponse(
         message="Reel Automation Dashboard API is running",
@@ -65,3 +88,9 @@ async def root():
 @app.get("/health", response_model=HealthResponse)
 async def health_check():
     return HealthResponse(status="ok")
+
+
+# /healthz alias — some infra tooling (GCP, k8s) expects this path
+@app.get("/healthz")
+async def healthz():
+    return {"status": "ok", "service": "reel-backend"}

@@ -591,6 +591,50 @@ def generate_with_ai_fallback(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Search query sanitizer
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _clean_search_query(query: str) -> str:
+    """
+    Sanitize LLM-returned Pexels search queries.
+
+    Fixes two common LLM mistakes:
+      1. Hashtag contamination: '#BudgetTravel' → 'budget travel'
+      2. CamelCase concatenation: 'budgettravel europeadventure'
+         → 'budget travel europe adventure'
+
+    Strategy:
+      - Remove '#' symbols
+      - Split CamelCase / PascalCase into separate tokens
+      - Replace underscores/hyphens with spaces
+      - Lowercase and collapse whitespace
+      - Remove duplicate consecutive words
+    """
+    if not query:
+        return "cinematic aerial travel"
+
+    # Remove hashtag symbols
+    q = query.replace("#", "")
+
+    # Split CamelCase: 'BudgetTravel' → 'Budget Travel'
+    q = re.sub(r"([a-z])([A-Z])", r"\1 \2", q)
+    q = re.sub(r"([A-Z]+)([A-Z][a-z])", r"\1 \2", q)
+
+    # Underscores and hyphens → spaces
+    q = re.sub(r"[_-]", " ", q)
+
+    # Collapse whitespace and lowercase
+    q = re.sub(r"\s+", " ", q).strip().lower()
+
+    # Remove duplicate consecutive words ('drone drone' → 'drone')
+    parts = q.split()
+    deduped = [w for i, w in enumerate(parts) if i == 0 or w != parts[i - 1]]
+    q = " ".join(deduped)
+
+    return q or "cinematic aerial travel"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Validation helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -695,12 +739,15 @@ def generate_script(topic: str, hook: str | None = None, log_handler=None) -> di
                 # Single-source rule: voice is always identical to display.
                 # The LLM outputs ONE text field; we propagate it to both
                 # pipeline slots so downstream code needs no changes.
-                q = str(s.get("search_query", "")).strip()
+                raw_q = str(s.get("search_query", "")).strip()
+                # Sanitize: fix CamelCase concatenation and hashtag contamination
+                # e.g. 'budgettravel europeadventure' → 'budget travel europe adventure'
+                q = _clean_search_query(raw_q)
                 if d and _line_is_valid(d):
                     scenes.append({
                         "display": d,
                         "voice": d,          # same text — Rule 3 enforced here
-                        "search_query": q or "cinematic aerial travel",
+                        "search_query": q,
                     })
 
         # Validate: need at least 4 good scenes with topic relevance

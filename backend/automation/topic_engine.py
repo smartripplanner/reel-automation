@@ -1,5 +1,38 @@
 import random
+import re
 from datetime import datetime
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Topic string sanitization
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _strip_leading_superlative(text: str) -> str:
+    """
+    Remove a leading "Best / Top / How to" before we prepend our own prefix.
+
+    Without this, a niche saved as "Best Budget Countries to Visit in Europe"
+    becomes "Best Best Budget Countries..." in the expanded topic string.
+    """
+    lower = text.lower()
+    for prefix in ("best ", "top ", "how to ", "most "):
+        if lower.startswith(prefix):
+            return text[len(prefix):].strip()
+    return text
+
+
+def _remove_consecutive_duplicate_words(text: str) -> str:
+    """
+    Safety net: 'Best Best Budget' → 'Best Budget'.
+    Handles any case-insensitive adjacent duplicate.
+    """
+    words = text.split()
+    result: list[str] = []
+    for word in words:
+        if result and word.lower() == result[-1].lower():
+            continue
+        result.append(word)
+    return " ".join(result)
 
 
 TOPIC_CATEGORIES = {
@@ -422,10 +455,13 @@ def generate_unique_topics(category_hint: str | None, count: int = 3) -> list[st
 
     # ── Custom / free-form niche ──────────────────────────────────────────────
     if category is None:
-        niche_clean = (category_hint or "general").strip()
-        # random.sample guarantees no two reels share the same angle suffix
+        # Strip leading "Best/Top" so we don't produce "Best Best Budget..."
+        niche_clean = _strip_leading_superlative((category_hint or "general").strip())
         angles = random.sample(_BATCH_ANGLE_POOL, min(count, len(_BATCH_ANGLE_POOL)))
-        return [f"Best {niche_clean} — {angle} in {year}" for angle in angles]
+        return [
+            _remove_consecutive_duplicate_words(f"Best {niche_clean} — {angle} in {year}")
+            for angle in angles
+        ]
 
     # ── Known category — random.sample on the template list ──────────────────
     config   = TOPIC_CATEGORIES[category]
@@ -470,9 +506,12 @@ def generate_topic(category_hint: str | None = None, log_handler=None) -> dict:
     # The LLM in script_engine will write content specifically about this niche.
     if category is None:
         year = datetime.utcnow().year
-        niche_clean = (category_hint or "general").strip()
-        direct_topic = f"Best {niche_clean} ideas and trends in {year}"
-        _log(log_handler, f"Custom niche '{niche_clean}' -> direct topic: '{direct_topic}'")
+        # Strip any leading "Best/Top/..." so we don't produce "Best Best Budget..."
+        niche_clean = _strip_leading_superlative((category_hint or "general").strip())
+        direct_topic = _remove_consecutive_duplicate_words(
+            f"Best {niche_clean} ideas and trends in {year}"
+        )
+        _log(log_handler, f"Custom niche '{category_hint}' -> direct topic: '{direct_topic}'")
         return {
             "topic": direct_topic,
             "category": niche_clean.lower(),
