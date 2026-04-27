@@ -25,6 +25,7 @@ Total:                   ~55-90 s   (vs 8-15 min MoviePy in previous version)
 
 from __future__ import annotations
 
+import gc
 import os
 import re
 import tempfile
@@ -43,6 +44,20 @@ from automation.video_engine import create_reel_video
 from utils.storage import BASE_DIR, ensure_storage_dirs
 
 MEDIA_FETCH_COUNT = 15  # kept for fallback fetch_video_clips calls
+
+# ── Memory budget constants ────────────────────────────────────────────────────
+# Render free tier: 512 MB RAM.  Target: stay under 400 MB at all times.
+#
+# MAX_SCENES    : fetch and render at most 3 clips (not 5).
+#                 Each 720p clip is ~5-10 MB; 3 clips = ~15-30 MB vs 5 clips = ~50 MB.
+# MAX_WORKERS   : 1 — no parallel media+audio fetch.
+#                 Parallel fetch held two large downloads in RAM simultaneously.
+# ENABLE_WHISPER: False — faster-whisper loads a 75 MB model into RAM exactly
+#                 when FFmpeg is also active. The combination always OOMs.
+#                 Re-enable once moved to a plan with 1 GB+ RAM.
+MAX_SCENES     = 3
+MAX_WORKERS    = 1
+ENABLE_WHISPER = False
 
 # ── Funnel CTA — appended to every Instagram caption ─────────────────────────
 # Edit this string to update the CTA across all future reels without touching
@@ -221,12 +236,13 @@ def run_pipeline(
             sp = generate_script(tp["topic"], log_handler=log_handler)
             return tp, sp
 
-        # Run scrape + topic/script in parallel
-        with ThreadPoolExecutor(max_workers=2) as pool:
+        # Run sequentially (MAX_WORKERS=1 — no parallel threads holding RAM)
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
             f_scrape = pool.submit(_do_scrape)
             f_script = pool.submit(_do_topic_and_script)
             topic_payload, script_payload = f_script.result()
             trending_reels = f_scrape.result()
+        gc.collect()
 
         resolved_topic = topic_payload["topic"]
 
@@ -251,6 +267,17 @@ def run_pipeline(
             from automation.script_engine import _fallback_hashtags
             hashtags = _fallback_hashtags(resolved_topic)
 
+        # ── Enforce scene limit BEFORE anything touches disk or RAM ──────────────
+        # The LLM produces 5 scenes; we only fetch/render 3 to stay under 400 MB.
+        # Trim the script payloads in-place so every downstream stage sees 3 scenes.
+        if script_payload.get("scenes"):
+            script_payload["scenes"] = script_payload["scenes"][:MAX_SCENES]
+        for key in ("text", "voice_text"):
+            if script_payload.get(key):
+                lines = script_payload[key].splitlines()
+                script_payload[key] = "\n".join(lines[:MAX_SCENES])
+        gc.collect()
+
         # ── Stage 1: Format routing ───────────────────────────────────────────
         pipeline_cfg = build_pipeline_config(
             script_payload=script_payload,
@@ -262,61 +289,55 @@ def run_pipeline(
         trending_audio_url = pipeline_cfg.get("trending_audio_url")
         reel_id = resolved_topic.replace(" ", "_")[:40]
 
-        # ── Stage 2: Voice/Audio + Scene Media in parallel ────────────────────
-        scenes = script_payload.get("scenes", [])
+        # ── Stage 2: Audio first, then media (sequential to cap RAM) ────────────
+        # Previously ran audio+media in parallel (2 workers).
+        # With MAX_WORKERS=1, tasks execute one at a time — we trade ~10 s of
+        # wall-clock time for ~50 MB of peak RAM savings.
+        scenes = script_payload.get("scenes", [])[:MAX_SCENES]
         _log(log_handler, f"Fetching {len(scenes)} scene clips + audio ({pipeline_cfg['format_type']})...")
         voice_path: str = ""
         clip_paths: list[str] = []
 
-        def _do_audio():
-            if use_tts:
-                return generate_voice(
-                    script_text=display_text,
-                    log_handler=log_handler,
-                    voice_text=voice_text,
-                )
-            # text_music path — download trending IG audio
-            dl = download_trending_audio(trending_audio_url, reel_id, log_handler)
-            if dl:
-                return dl
-            _log(log_handler, "IG audio download failed — falling back to TTS")
-            return generate_voice(
+        # Audio first — TTS is CPU-bound and light on RAM
+        if use_tts:
+            voice_path = generate_voice(
                 script_text=display_text,
                 log_handler=log_handler,
                 voice_text=voice_text,
             )
-
-        def _do_media():
-            # Fetch one video per scene's unique search_query
-            if scenes:
-                paths = fetch_scene_clips(scenes, log_handler)
-            else:
-                paths = fetch_video_clips(resolved_topic, log_handler, count=5)
-            return [p for p in paths if (BASE_DIR / Path(p)).exists()]
-
-        with ThreadPoolExecutor(max_workers=2) as pool:
-            fv = pool.submit(_do_audio)
-            fm = pool.submit(_do_media)
-            for done in as_completed([fv, fm]):
-                if done is fv:
-                    voice_path = done.result()
-                else:
-                    clip_paths = done.result()
+        else:
+            dl = download_trending_audio(trending_audio_url, reel_id, log_handler)
+            voice_path = dl or generate_voice(
+                script_text=display_text,
+                log_handler=log_handler,
+                voice_text=voice_text,
+            )
+        gc.collect()
 
         if not voice_path or not voice_file_exists(voice_path):
             raise RuntimeError("Audio generation produced no audio file.")
 
+        # Media fetch second — sequential, one clip at a time (already sequential inside)
+        if scenes:
+            clip_paths = fetch_scene_clips(scenes, log_handler)
+        else:
+            clip_paths = fetch_video_clips(resolved_topic, log_handler, count=MAX_SCENES)
+        clip_paths = [p for p in clip_paths if (BASE_DIR / Path(p)).exists()]
+        gc.collect()
+
         if not clip_paths:
             _log(log_handler, "No scene clips found — retrying with topic")
-            clip_paths = fetch_video_clips(resolved_topic, log_handler, count=5)
+            clip_paths = fetch_video_clips(resolved_topic, log_handler, count=MAX_SCENES)
             clip_paths = [p for p in clip_paths if (BASE_DIR / Path(p)).exists()]
 
-        # ── Stage 3: Captions + Render ────────────────────────────────────────
-        audio_abs = str(BASE_DIR / Path(voice_path))
-        audio_duration = _get_audio_duration(voice_path)
-
-        ass_path: str | None = None
-        if pipeline_cfg["use_whisper"]:
+        # ── Stage 3: Render ───────────────────────────────────────────────────
+        # Whisper (faster-whisper) is DISABLED — it loads a 75 MB model exactly
+        # when FFmpeg is also running, pushing Render free tier over 512 MB.
+        # Re-enable ENABLE_WHISPER=True when running on 1 GB+ RAM.
+        if ENABLE_WHISPER and pipeline_cfg.get("use_whisper"):
+            audio_abs = str(BASE_DIR / Path(voice_path))
+            audio_duration = _get_audio_duration(voice_path)
+            ass_path: str | None = None
             try:
                 with tempfile.NamedTemporaryFile(suffix=".ass", delete=False, mode="w") as tmp:
                     tmp_ass = tmp.name
@@ -331,6 +352,12 @@ def run_pipeline(
             except Exception as cap_exc:
                 _log(log_handler, f"Caption generation skipped: {cap_exc}")
                 ass_path = None
+        else:
+            ass_path = None
+            if not ENABLE_WHISPER:
+                _log(log_handler, "[Memory] Whisper disabled — subtitles skipped")
+
+        gc.collect()   # free audio buffers before FFmpeg starts
 
         reel_path = create_reel_video(
             clip_paths=clip_paths,
@@ -339,7 +366,21 @@ def run_pipeline(
             ass_path=ass_path,
             log_handler=log_handler,
         )
+        gc.collect()
         _log(log_handler, "Reel saved")
+
+        # ── Delete scene clip files — they are no longer needed ───────────────
+        # video_engine._ffmpeg_render_low_mem() already deletes source clips
+        # during Phase 1, but some may survive if the render path changed.
+        # This is a belt-and-suspenders cleanup.
+        for cp in clip_paths:
+            try:
+                full = BASE_DIR / Path(cp)
+                if full.exists():
+                    full.unlink()
+            except Exception:
+                pass
+        gc.collect()
 
         # ── Cloud Bridge: upload to S3 after successful FFmpeg render ─────────
         video_url: str | None = None

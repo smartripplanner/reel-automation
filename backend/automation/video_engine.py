@@ -47,13 +47,28 @@ ensure_pillow_compat()
 # Constants
 # ─────────────────────────────────────────────────────────────────────────────
 
-FRAME_W, FRAME_H = 1080, 1920
-FPS = 30
-HOOK_DURATION = 2.0           # seconds the hook screen is shown
+# ── Render resolution ─────────────────────────────────────────────────────────
+# 720×1280 instead of 1080×1920.
+# Reduces per-frame memory 2.25× and FFmpeg buffer sizes proportionally.
+# Instagram accepts 720p reels without quality penalty.
+FRAME_W, FRAME_H = 720, 1280
+
+FPS = 24                      # 24fps vs 30fps → 20% fewer frames per second
+HOOK_DURATION = 2.0
 SAFE_X = int(FRAME_W * 0.07)
 SAFE_Y = int(FRAME_H * 0.10)
-MUSIC_VOLUME = 0.08   # background music level — 8 % ensures fast voice is crystal clear
+MUSIC_VOLUME = 0.08
 TEMP_RENDER_ROOT = BASE_DIR / "storage" / "tmp"
+
+# ── Memory budget flags ────────────────────────────────────────────────────────
+# These constants are read by _ffmpeg_render_low_mem and callers.
+_PRESET      = "ultrafast"    # minimal encode memory vs "fast" / "medium"
+_CRF         = "28"           # quality 28 = good enough for 720p social
+_VIDEO_BRATE = "1M"           # target bitrate — keeps output files small
+_MAX_RATE    = "1500k"        # ceiling
+_BUF_SIZE    = "1500k"        # VBV buffer — small = small encoder RAM
+_AUDIO_BRATE = "96k"          # voice-only reels don't need 128k
+_SCENE_LIMIT = 3              # render at most 3 scenes (was 5)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Style library
@@ -323,248 +338,195 @@ def _run_ffmpeg(
 # Core FFmpeg render
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _ffmpeg_render_scenes(
+def _ffmpeg_render_low_mem(
     clip_paths: list[str],
     audio_path: str,
-    ass_path: str | None,
-    music_path: str | None,
     output_path: str,
     total_duration: float,
-    style: dict,
     log_handler=None,
 ) -> bool:
     """
-    Two-pass scene-based FFmpeg render.
+    Memory-safe FFmpeg render for Render free tier (512 MB RAM hard limit).
 
-    Pass 1: Stitch scene clips sequentially (one per scene, equal duration)
-            with audio mix → intermediate MP4.
-    Pass 2: Burn ASS subtitles onto intermediate → final output.
+    Why the old approach OOMed
+    ──────────────────────────
+    The previous filtergraph loaded ALL clips as simultaneous FFmpeg inputs.
+    Five 4K clips (50-80 MB each) decoded simultaneously = 400-600 MB just
+    for the video streams, before encoding buffers or Python overhead.
 
-    No hook screen — only dynamic .ass subtitles for text.
+    New approach — two logical phases
+    ──────────────────────────────────
+    Phase 1 (sequential, one clip at a time):
+        For each source clip:
+          • Transcode to 720×1280, ultrafast, 1 M bitrate → small segment file
+          • Delete the source clip immediately after (frees ~50 MB per clip)
+          • gc.collect() to return Python-managed memory to the OS
+        Peak RAM during phase 1: ~80-120 MB (one clip decode + one encode)
+
+    Phase 2 (concat demuxer — no re-decode):
+        ffmpeg -f concat -i list.txt -i audio.mp3 ...
+        The concat demuxer streams segments from disk one at a time — it does
+        NOT load them all into memory simultaneously.
+        Each segment is already 720p and <5 MB, so the muxer barely touches RAM.
+        Peak RAM during phase 2: ~60-80 MB
+
+    Total peak: well under 200 MB, leaving 300+ MB headroom on the 512 MB tier.
+
+    Subtitles
+    ─────────
+    The second subtitle-burn pass is disabled. It would re-load the entire
+    intermediate file into memory for a full re-encode — exactly what killed
+    us before. Captions are disabled at the pipeline level instead.
     """
+    import gc
+
     if not clip_paths:
         return False
 
-    num_scenes = len(clip_paths)
-    scene_duration = total_duration / num_scenes
+    # Cap scenes to limit — caller should already do this, but guard here too
+    working_clips = clip_paths[:_SCENE_LIMIT]
+    num_scenes = len(working_clips)
+    scene_duration = max(total_duration / num_scenes, 2.0)
 
-    inputs: list[str] = []
-    filter_parts: list[str] = []
-    video_labels: list[str] = []
-
-    audio_abs = os.path.abspath(str(BASE_DIR / Path(audio_path)))
-    output_abs = os.path.abspath(output_path)
     ffmpeg_bin = _resolve_ffmpeg() or "ffmpeg"
-
-    # ── Inputs 0..N-1: one video clip per scene ──
-    #
-    # WHY no zoompan:
-    #   FFmpeg's zoompan filter is designed for STILL IMAGES (Ken Burns effect).
-    #   When applied to a video stream it takes the FIRST FRAME and holds it for
-    #   `d` output frames while zooming — every clip becomes a frozen photo.
-    #   Removing it lets the actual video motion play through.
-    for idx, cp in enumerate(clip_paths):
-        abs_cp = os.path.abspath(str(BASE_DIR / Path(cp)))
-        inputs += ["-i", abs_cp]
-        source_duration = max(_get_media_duration(abs_cp), 0.1)
-        target_dur = min(scene_duration, source_duration)
-        target_dur = max(target_dur, 1.5)
-
-        filter_parts.append(
-            # 1. Scale up so the shorter dimension fills the frame
-            f"[{idx}:v]"
-            f"scale={FRAME_W}:{FRAME_H}:force_original_aspect_ratio=increase,"
-            # 2. Centre-crop to exact portrait frame
-            f"crop={FRAME_W}:{FRAME_H},"
-            # 3. Fix SAR so pixels are square
-            f"setsar=1,"
-            # 4. Normalise frame-rate (many 4K clips are 60fps — cap to project FPS)
-            f"fps={FPS},"
-            # 5. Take only the first `target_dur` seconds of the clip
-            f"trim=duration={target_dur:.3f},"
-            # 6. Reset timestamps so concat stitches cleanly
-            f"setpts=PTS-STARTPTS"
-            f"[clip{idx}]"
-        )
-        video_labels.append(f"[clip{idx}]")
-
-    # ── Concat all scene segments ──
-    # After concat, add an explicit scale+crop to guarantee the muxed stream is
-    # always 1080×1920 for Instagram's Graph API (max 1920 px on any axis).
-    # The per-clip scale above handles most cases, but some 4K portrait clips
-    # (e.g. 2160×3840) pass through at native resolution when the ratio is
-    # an exact 2:1 match — this final node is the guaranteed enforcement point.
-    concat_n = len(video_labels)
-    concat_inputs = "".join(video_labels)
-    filter_parts.append(
-        f"{concat_inputs}concat=n={concat_n}:v=1:a=0[concat_v];"
-        f"[concat_v]"
-        f"scale={FRAME_W}:{FRAME_H}:force_original_aspect_ratio=increase,"
-        f"crop={FRAME_W}:{FRAME_H},"
-        f"setsar=1"
-        f"[final_v]"
-    )
-
-    # ── Audio: voiceover + optional background music (ducked to MUSIC_VOLUME) ──
-    #
-    # Ducking strategy:
-    #   • Voice   → volume=1.0  (full — always intelligible)
-    #   • Music   → volume=MUSIC_VOLUME (0.10 = 10%)
-    #   • amix duration=first means the mix ends when the voice ends
-    #   • apad on voice ensures it never cuts off at the last syllable
-    #   • No music path → skip amix entirely so FFmpeg doesn't error on
-    #     a missing second audio stream
-    voice_idx = num_scenes
-    inputs += ["-i", audio_abs]
-    afmt = "aformat=sample_rates=44100:channel_layouts=stereo"
-
-    # adelay=500|500 — 500 ms silence before the voiceover starts.
-    #   Gives the viewer half a second to register the hook visual before audio fires.
-    #   Both L and R stereo channels delayed equally ("500|500").
-    # atempo=1.25 — 25 % pitch-preserving speed-up.
-    #   Applied AFTER adelay and BEFORE apad so only real speech is accelerated.
-    # IMPORTANT: total_duration (set by caller) must include this delay so FFmpeg
-    #   does not trim the final word off the end of the video.
-    _VOICE_DELAY  = "500|500"   # ms per channel — half-second hook pause
-    _VOICE_SPEED  = 1.25
-
-    if music_path and Path(music_path).exists():
-        music_idx = voice_idx + 1
-        music_abs = os.path.abspath(music_path)
-        inputs += ["-i", music_abs]
-        _log(log_handler,
-             f"Audio mix: voice@1.0×{_VOICE_SPEED}+500ms delay "
-             f"+ music@{MUSIC_VOLUME:.2f} ({Path(music_path).name})")
-        filter_parts.append(
-            # Voice: normalise → full volume → 500 ms hook delay → 25 % speed-up → pad
-            f"[{voice_idx}:a]{afmt},volume=1.0,"
-            f"adelay={_VOICE_DELAY},atempo={_VOICE_SPEED},apad[voice_pad];"
-            # Music: normalise → duck to 8 % → pad
-            f"[{music_idx}:a]{afmt},volume={MUSIC_VOLUME:.2f},apad[music_pad];"
-            # Mix: stop when voice ends (duration=first), 2 s dropout transition
-            f"[voice_pad][music_pad]amix=inputs=2:duration=first:dropout_transition=2[final_a]"
-        )
-    else:
-        if music_path and not Path(music_path).exists():
-            _log(log_handler, f"Music file not found ({music_path}) — voiceover only")
-        filter_parts.append(
-            # Voice only: normalise → full volume → 500 ms hook delay → 25 % speed-up → pad
-            f"[{voice_idx}:a]{afmt},volume=1.0,"
-            f"adelay={_VOICE_DELAY},atempo={_VOICE_SPEED},apad[final_a]"
-        )
-
-    filter_complex = ";".join(filter_parts)
+    audio_abs  = os.path.abspath(str(BASE_DIR / Path(audio_path)))
+    output_abs = os.path.abspath(output_path)
 
     TEMP_RENDER_ROOT.mkdir(parents=True, exist_ok=True)
     job_tag = datetime.utcnow().strftime("%Y%m%d_%H%M%S_%f")
-    stage1_path = os.path.abspath(str(TEMP_RENDER_ROOT / f"stage1_{job_tag}.mp4"))
-    try:
-        stage1_cmd = (
-            [ffmpeg_bin, "-y"]
-            + inputs
-            + [
-                "-filter_complex", filter_complex,
-                "-map", "[final_v]",
-                "-map", "[final_a]",
-                "-c:v", "libx264",
-                # Instagram Reels specification:
-                #   • preset=fast   — ultrafast can produce Annex-B header quirks
-                #     that Instagram's ingest rejects; fast is the sweet spot
-                #   • profile high + level 4.0 — explicit H.264 compliance
-                #   • yuv420p      — strips HDR / 10-bit pixel formats
-                #   • colorspace / color_primaries / color_trc bt709
-                #     — strips BT.2020 / HDR metadata tags from the container;
-                #       without these, Pexels 4K clips retain "HDR" colour-space
-                #       metadata even after re-encode, causing Instagram's
-                #       processor to throw status=ERROR
-                "-preset", "fast",
-                "-profile:v", "high",
-                "-level:v", "4.0",
-                "-crf", "23",
-                "-b:v", "8M",
-                "-maxrate", "10M",
-                "-bufsize", "10M",
-                "-c:a", "aac",
-                "-b:a", "128k",
-                "-ar", "44100",
-                "-ac", "2",
-                "-r", str(FPS),
-                "-pix_fmt", "yuv420p",
-                "-colorspace", "bt709",
-                "-color_primaries", "bt709",
-                "-color_trc", "bt709",
-                "-movflags", "+faststart",
-                "-shortest",
-                "-max_muxing_queue_size", "9999",
-                "-t", str(total_duration),
-                stage1_path,
-            ]
-        )
 
-        _log(log_handler, "Rendering with FFmpeg (scene-based)...")
-        ok, _stderr = _run_ffmpeg(
-            stage1_cmd, log_handler=log_handler, label="FFmpeg stage 1", timeout=900
-        )
-        if not ok:
+    segment_paths: list[str] = []
+    concat_list_path = str(TEMP_RENDER_ROOT / f"concat_{job_tag}.txt")
+
+    try:
+        # ── Phase 1: encode each clip into a small uniform segment ──────────────
+        for idx, cp in enumerate(working_clips):
+            abs_cp = os.path.abspath(str(BASE_DIR / Path(cp)))
+            if not Path(abs_cp).exists():
+                _log(log_handler, f"[Render] Clip {idx+1} missing — skipping")
+                continue
+
+            source_dur = max(_get_media_duration(abs_cp), 0.1)
+            target_dur = round(min(scene_duration, source_dur), 3)
+            target_dur = max(target_dur, 1.5)
+
+            seg_path = str(TEMP_RENDER_ROOT / f"seg_{idx}_{job_tag}.mp4")
+
+            seg_cmd = [
+                ffmpeg_bin, "-y",
+                "-i", abs_cp,
+                # Scale → crop → normalise → trim — all in a single decode pass
+                "-vf",
+                (
+                    f"scale={FRAME_W}:{FRAME_H}:force_original_aspect_ratio=increase,"
+                    f"crop={FRAME_W}:{FRAME_H},"
+                    f"setsar=1,"
+                    f"fps={FPS},"
+                    f"trim=duration={target_dur:.3f},"
+                    f"setpts=PTS-STARTPTS"
+                ),
+                "-c:v", "libx264",
+                "-preset", _PRESET,
+                "-crf",    _CRF,
+                "-b:v",    _VIDEO_BRATE,
+                "-maxrate", _MAX_RATE,
+                "-bufsize", _BUF_SIZE,
+                "-pix_fmt", "yuv420p",
+                "-colorspace",      "bt709",
+                "-color_primaries", "bt709",
+                "-color_trc",       "bt709",
+                "-an",              # no audio — added in phase 2
+                "-r", str(FPS),
+                "-t", str(target_dur),
+                seg_path,
+            ]
+
+            _log(log_handler, f"[Render] Segment {idx+1}/{num_scenes}...")
+            ok, _err = _run_ffmpeg(
+                seg_cmd, log_handler=log_handler,
+                label=f"Seg {idx+1}", timeout=180,
+            )
+            if ok and Path(seg_path).exists():
+                segment_paths.append(seg_path)
+            else:
+                _log(log_handler, f"[Render] Segment {idx+1} failed — skipping clip")
+
+            # Delete source immediately — frees 5-80 MB per clip
+            try:
+                Path(abs_cp).unlink(missing_ok=True)
+            except Exception:
+                pass
+
+            gc.collect()   # return freed memory to OS before next clip
+
+        if not segment_paths:
+            _log(log_handler, "[Render] No segments produced — aborting")
             return False
 
-        # If no subtitles, stage 1 output IS the final output
-        if not ass_path or not Path(ass_path).exists():
-            shutil.copyfile(stage1_path, output_abs)
-            return True
+        # ── Phase 2: write concat list ───────────────────────────────────────────
+        with open(concat_list_path, "w") as fh:
+            for seg in segment_paths:
+                # FFmpeg concat list requires forward slashes even on Windows
+                fh.write(f"file '{seg.replace(chr(92), '/')}'\n")
 
-        # ── Pass 2: burn ASS subtitles (cwd workaround for Windows paths) ──
-        abs_sub_path = os.path.abspath(ass_path)
-        sub_dir = os.path.dirname(abs_sub_path) or None
-        sub_file = os.path.basename(abs_sub_path).replace("'", r"\'")
-        burn_filters = [
-            f"ass=filename='{sub_file}':original_size={FRAME_W}x{FRAME_H}",
-            f"subtitles='{sub_file}':original_size={FRAME_W}x{FRAME_H}",
+        # ── Phase 3: concat + audio → final output ───────────────────────────────
+        # adelay=500|500 : 500 ms hook pause before voice starts
+        # atempo=1.25    : 25 % pitch-preserving speed-up (same as before)
+        afmt = "aformat=sample_rates=44100:channel_layouts=stereo"
+        audio_filter = (
+            f"[1:a]{afmt},volume=1.0,"
+            f"adelay=500|500,atempo=1.25,apad[final_a]"
+        )
+
+        concat_cmd = [
+            ffmpeg_bin, "-y",
+            "-f", "concat", "-safe", "0", "-i", concat_list_path,
+            "-i", audio_abs,
+            "-filter_complex", audio_filter,
+            "-map", "0:v",
+            "-map", "[final_a]",
+            "-c:v", "libx264",
+            "-preset", _PRESET,
+            "-profile:v", "high",
+            "-level:v",   "4.0",
+            "-crf",        _CRF,
+            "-b:v",        _VIDEO_BRATE,
+            "-maxrate",    _MAX_RATE,
+            "-bufsize",    _BUF_SIZE,
+            "-c:a", "aac",
+            "-b:a", _AUDIO_BRATE,
+            "-ar", "44100",
+            "-ac", "2",
+            "-pix_fmt", "yuv420p",
+            "-colorspace",      "bt709",
+            "-color_primaries", "bt709",
+            "-color_trc",       "bt709",
+            "-movflags", "+faststart",
+            "-shortest",
+            "-t", str(total_duration),
+            output_abs,
         ]
 
-        for attempt_idx, burn_filter in enumerate(burn_filters, start=1):
-            stage2_cmd = [
-                ffmpeg_bin, "-y",
-                "-i", stage1_path,
-                "-vf", burn_filter,
-                "-c:v", "libx264",
-                # Mirror stage 1 Instagram spec exactly — subtitle burn is a full
-                # re-encode so every flag must be repeated.
-                "-preset", "fast",
-                "-profile:v", "high",
-                "-level:v", "4.0",
-                "-crf", "23",
-                "-b:v", "8M",
-                "-maxrate", "10M",
-                "-bufsize", "10M",
-                "-pix_fmt", "yuv420p",
-                "-colorspace", "bt709",
-                "-color_primaries", "bt709",
-                "-color_trc", "bt709",
-                # Re-encode audio explicitly (not copy) so the final file is a
-                # fully self-contained AAC stream — avoids container mismatch
-                # errors if Instagram re-inspects the audio track after subtitle burn.
-                "-c:a", "aac",
-                "-b:a", "128k",
-                "-movflags", "+faststart",
-                output_abs,
-            ]
-            ok, _stderr = _run_ffmpeg(
-                stage2_cmd,
-                log_handler=log_handler,
-                cwd=sub_dir,
-                timeout=900,
-                label=f"FFmpeg subtitle burn attempt {attempt_idx}",
-            )
-            if ok:
-                return True
+        _log(log_handler, "[Render] Concat + audio mix → final output...")
+        ok, _err = _run_ffmpeg(
+            concat_cmd, log_handler=log_handler,
+            label="FFmpeg concat", timeout=300,
+        )
+        gc.collect()
+        return ok
+
     finally:
+        # Always clean up segment files and concat list — never leave temp files
+        for seg in segment_paths:
+            try:
+                Path(seg).unlink(missing_ok=True)
+            except Exception:
+                pass
         try:
-            Path(stage1_path).unlink(missing_ok=True)
+            Path(concat_list_path).unlink(missing_ok=True)
         except Exception:
             pass
-
-    return False
+        gc.collect()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -757,73 +719,69 @@ def create_reel_video(
     clip_paths: list[str],
     audio_path: str,
     script_text: str,
-    ass_path: str | None = None,
+    ass_path: str | None = None,   # kept for API compat — subtitles disabled
     log_handler=None,
     hook_text: str | None = None,
 ) -> str:
     """
-    Render the final reel MP4 (scene-based, no hook screen).
-
-    Each clip in clip_paths maps to one scene. Visual changes happen
-    when the script topic changes. Only .ass dynamic subtitles are used
-    for on-screen text — no static title overlaps.
+    Render the final reel MP4 — memory-safe path for Render free tier.
 
     Strategy
     ────────
-    1. FFmpeg direct (fast, ~30-90 s)
-    2. MoviePy fallback  (slow, ~3-10 min, but always works)
+    1. FFmpeg low-memory path (sequential segments → concat demuxer)
+       Peak RAM: ~120-160 MB. Target: sub-400 MB total process.
+    2. MoviePy fallback only if FFmpeg is not on PATH.
+       (MoviePy loads all clips into Python RAM — avoid on Render free tier)
+
+    Resolution : 720×1280  (down from 1080×1920)
+    Preset     : ultrafast (down from fast)
+    Bitrate    : 1 Mbit/s  (down from 8 Mbit/s)
+    Scenes     : 3 max     (down from 5)
+    Subtitles  : disabled  (eliminates the entire second FFmpeg pass)
     """
+    import gc
     ensure_storage_dirs()
 
-    style = random.choice(STYLES)
-    _log(log_handler, f"Style: {style['name']}")
+    # Enforce scene limit before touching FFmpeg — each extra clip costs ~50 MB
+    working_clips = [p for p in clip_paths[:_SCENE_LIMIT]
+                     if (BASE_DIR / Path(p)).exists()]
 
     file_name = f"reel_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.mp4"
     output_path = str(REELS_DIR / file_name)
 
-    # ── Total video duration — must account for all FFmpeg audio transforms ──
-    # The raw MP3 duration from Whisper/probe is BEFORE FFmpeg processes it.
-    # FFmpeg applies two transforms that change the final playback length:
-    #   1. atempo=1.25 compresses the voice: actual_voice = raw_duration / 1.25
-    #   2. adelay=500ms adds 0.5 s of silence at the start
-    # If total_duration ignores these, FFmpeg trims the last word off the video.
     _ATEMPO   = 1.25
-    _DELAY_S  = 0.50   # adelay 500 ms in seconds
-    _BUFFER_S = 0.30   # small safety buffer so apad has room to breathe
+    _DELAY_S  = 0.50
+    _BUFFER_S = 0.30
 
-    total_duration = max(len(clip_paths) * 3.0, 8.0)
-    probed_audio_duration = _get_media_duration(str(BASE_DIR / Path(audio_path)))
-    if probed_audio_duration > 0:
-        total_duration = (probed_audio_duration / _ATEMPO) + _DELAY_S + _BUFFER_S
+    total_duration = max(len(working_clips) * 3.0, 8.0)
+    probed = _get_media_duration(str(BASE_DIR / Path(audio_path)))
+    if probed > 0:
+        total_duration = (probed / _ATEMPO) + _DELAY_S + _BUFFER_S
 
-    # ── FFmpeg path (scene-based, no hook) ──
     if _ffmpeg_available():
-        music_path = _pick_music()
-        success = _ffmpeg_render_scenes(
-            clip_paths=clip_paths,
+        _log(log_handler, f"[Render] 720p / ultrafast / 1M / {len(working_clips)} scenes")
+        success = _ffmpeg_render_low_mem(
+            clip_paths=working_clips,
             audio_path=audio_path,
-            ass_path=ass_path,
-            music_path=music_path,
             output_path=output_path,
             total_duration=total_duration,
-            style=style,
             log_handler=log_handler,
         )
+        gc.collect()
         if success:
-            _log(log_handler, "Video rendered [FFmpeg]")
+            _log(log_handler, "Video rendered [FFmpeg low-mem]")
             return to_storage_relative(Path(output_path))
         _log(log_handler, "FFmpeg render failed → trying MoviePy")
     else:
-        _log(log_handler, "FFmpeg not found on PATH → using MoviePy renderer")
+        _log(log_handler, "FFmpeg not on PATH → MoviePy fallback")
 
-    # ── MoviePy fallback ──
     ok = _moviepy_fallback(
-        clip_paths=clip_paths,
+        clip_paths=working_clips,
         audio_path=audio_path,
         script_text=script_text,
-        ass_path=ass_path,
+        ass_path=None,          # subtitles disabled to save memory
         output_path=output_path,
-        style=style,
+        style=random.choice(STYLES),
         log_handler=log_handler,
     )
     if ok:

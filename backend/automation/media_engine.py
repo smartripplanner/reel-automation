@@ -173,59 +173,63 @@ def _extract_search_keywords(topic: str) -> str:
     return " ".join(keywords[:3]) if keywords else topic.split()[0]
 
 
+# ── Memory budget: maximum clip dimensions to download ─────────────────────────
+# 4K clips (2160×3840) are 50-80 MB each and cause OOM on Render free tier.
+# We want the SMALLEST clip that fills 720×1280 — that's 720p portrait (720×1280).
+# Allow up to 1080p (1080×1920) as fallback if 720p unavailable.
+_MAX_CLIP_HEIGHT  = 1440   # reject anything taller than this (rejects 4K/UHD)
+_MAX_CLIP_SIZE_MB = 10     # hard cap: abort download after this many MB
+
+
 def _pick_mp4_link(video_files: list[dict], log_handler=None) -> str | None:
     """
     Strict MP4 selection from a Pexels video_files array.
 
-    Priority:
-        1. HD/UHD mp4,  portrait  (height >= width, ideal for vertical reels)
-        2. HD/UHD mp4,  any orientation
-        3. Any mp4,     portrait
-        4. Any mp4,     any orientation
-    Returns None only when no mp4 entry exists at all.
+    Memory-safe priority order (smallest usable clip wins):
+        1. Portrait mp4, height 720-1440  (720p-1080p — ideal for 720×1280 output)
+        2. Portrait mp4, any height       (last resort before giving up)
+        3. Any mp4                         (orientation fallback)
+
+    4K / UHD clips (height > 1440) are explicitly rejected — they are 50-80 MB
+    each and will OOM the Render free tier during FFmpeg decode.
     """
     if not video_files:
         return None
 
-    # ── Step 1: keep ONLY true video/mp4 files ───────────────────────────────
-    # Use (value or "") guards throughout — Pexels occasionally returns null
-    # for quality/file_type/link keys (key present, value None), which makes
-    # .get(key, "default") return None instead of the default.
+    # ── Keep only true video/mp4 files with a non-empty link ─────────────────
     mp4_files = [
         f for f in video_files
         if isinstance(f, dict)
         and (f.get("file_type") or "").strip().lower() in ("video/mp4", "mp4")
-        and (f.get("link") or "").strip()       # must have a non-null, non-empty link
+        and (f.get("link") or "").strip()
     ]
 
     if not mp4_files:
         types_seen = list({f.get("file_type") for f in video_files if isinstance(f, dict)})
         _log(log_handler,
-             f"  [pexels] no mp4 in video_files "
-             f"({len(video_files)} entries, file_types seen: {types_seen})")
+             f"  [pexels] no mp4 ({len(video_files)} entries, types: {types_seen})")
         return None
 
-    # ── Step 2: split into HD/UHD vs SD ──────────────────────────────────────
-    # "quality" can be null — use (value or "") so .lower() never crashes.
-    hd_files = [
-        f for f in mp4_files
-        if (f.get("quality") or "").lower() in ("hd", "uhd")
-        or max(f.get("width") or 0, f.get("height") or 0) >= 1080
-    ]
-    # Always fall back to any mp4 (SD) rather than returning None
-    pool = hd_files or mp4_files
-
-    # ── Step 3: prefer portrait framing for vertical reels ───────────────────
+    # ── Split into portrait vs landscape ─────────────────────────────────────
     portrait = [
-        f for f in pool
+        f for f in mp4_files
         if (f.get("height") or 0) >= (f.get("width") or 0)
     ]
-    candidates = portrait or pool
+    pool = portrait or mp4_files
 
-    # ── Step 4: highest resolution wins ──────────────────────────────────────
+    # ── Prefer 720p-1080p portrait; reject 4K (height > _MAX_CLIP_HEIGHT) ────
+    preferred = [
+        f for f in pool
+        if 720 <= (f.get("height") or 0) <= _MAX_CLIP_HEIGHT
+    ]
+    # Fall back to any portrait/mp4 if no clip fits the preferred range
+    candidates = preferred or pool
+
+    # ── Among candidates, pick the LOWEST resolution that still meets 720p ───
+    # Sorting ascending (smallest first) ensures we grab the lightest clip.
+    # Less data downloaded, less FFmpeg decode memory, faster pipeline.
     candidates.sort(
         key=lambda f: (f.get("width") or 0) * (f.get("height") or 0),
-        reverse=True,
     )
 
     chosen = candidates[0]
@@ -234,9 +238,9 @@ def _pick_mp4_link(video_files: list[dict], log_handler=None) -> str | None:
         _log(log_handler, "  [pexels] chosen entry has empty link — skipping")
         return None
 
-    quality  = chosen.get("quality") or "unknown"
-    width    = chosen.get("width")   or "?"
-    height   = chosen.get("height")  or "?"
+    quality = chosen.get("quality") or "unknown"
+    width   = chosen.get("width")   or "?"
+    height  = chosen.get("height")  or "?"
     _log(log_handler,
          f"  [pexels] mp4 selected: quality={quality} {width}x{height} -> {link[:80]}")
     return link
@@ -244,29 +248,50 @@ def _pick_mp4_link(video_files: list[dict], log_handler=None) -> str | None:
 
 def _download_video(url: str, output_path: Path, log_handler=None) -> None:
     """
-    Stream-download a URL to output_path.
+    Stream-download a video URL to output_path with a hard size cap.
 
-    Uses a 10 s connect timeout and a 120 s read timeout so large MP4 files
-    (10–50 MB) have time to transfer without blocking forever on a dead connection.
-    Raises requests.HTTPError / requests.Timeout on failure.
+    Hard limit: _MAX_CLIP_SIZE_MB (10 MB by default).
+    If the response body exceeds this, the download is aborted and the
+    partial file is deleted.  This prevents a 80 MB 4K clip from eating
+    RAM on Render's free tier even if _pick_mp4_link accidentally selected
+    a large file.
+
+    Raises ValueError if the size cap is hit (caller will try the next video).
+    Raises requests.HTTPError / requests.Timeout on network failure.
     """
     _log(log_handler, f"  [download] {url[:100]}")
     if not url.lower().split("?")[0].endswith((".mp4", ".mov", ".webm")):
-        # URL doesn't end in a video extension — log a warning but still try
         _log(log_handler, f"  [download] WARNING: URL may not be a video file: {url[:80]}")
 
-    with requests.get(url, stream=True, timeout=(10, 120)) as response:
-        response.raise_for_status()
-        content_type = response.headers.get("Content-Type", "")
-        if "image" in content_type:
-            raise ValueError(
-                f"Server returned an image ({content_type}) instead of video. "
-                f"URL: {url[:80]}"
-            )
-        with output_path.open("wb") as fh:
-            for chunk in response.iter_content(chunk_size=1024 * 1024):
-                if chunk:
-                    fh.write(chunk)
+    max_bytes = _MAX_CLIP_SIZE_MB * 1024 * 1024
+    bytes_written = 0
+
+    try:
+        with requests.get(url, stream=True, timeout=(10, 60)) as response:
+            response.raise_for_status()
+            content_type = response.headers.get("Content-Type", "")
+            if "image" in content_type:
+                raise ValueError(
+                    f"Server returned an image ({content_type}) instead of video."
+                )
+            with output_path.open("wb") as fh:
+                for chunk in response.iter_content(chunk_size=512 * 1024):  # 512 KB chunks
+                    if chunk:
+                        bytes_written += len(chunk)
+                        if bytes_written > max_bytes:
+                            # Abort — clip is too large for our memory budget
+                            raise ValueError(
+                                f"Clip exceeds {_MAX_CLIP_SIZE_MB} MB limit "
+                                f"({bytes_written // (1024*1024)} MB so far) — skipping"
+                            )
+                        fh.write(chunk)
+    except ValueError:
+        # Clean up partial file before re-raising so caller can try next video
+        try:
+            output_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+        raise
 
     size_kb = output_path.stat().st_size // 1024
     _log(log_handler, f"  [download] saved {output_path.name} ({size_kb} KB)")
@@ -310,7 +335,7 @@ def fetch_video_clips(topic: str, log_handler=None, count: int = 4) -> list[str]
     if pexels_api_key:
         try:
             kw = _extract_search_keywords(topic)
-            search_query = f"{kw} 4k aerial drone cinematic vertical".strip()
+            search_query = f"{kw} aerial drone cinematic vertical".strip()
             _log(log_handler, f"Pexels video search: '{search_query}'")
 
             response = requests.get(
@@ -374,11 +399,13 @@ _INDOOR_KEYWORDS = {
 def _aerial_suffix(query: str) -> str:
     """
     Suffix appended to every Pexels scene query.
-    '4k aerial drone cinematic vertical' maximises the chance of getting
-    true vertical HD drone footage — the visual style that makes reels feel
-    premium and high-production. Applied to all scenes uniformly.
+
+    Previously used '4k aerial drone cinematic vertical' which forced Pexels
+    to return 4K UHD clips (50-80 MB each).  Removing '4k' lets Pexels serve
+    HD/720p clips (3-10 MB) which are perfectly fine for a 720×1280 output
+    and fit comfortably within the Render free-tier memory budget.
     """
-    return "4k aerial drone cinematic vertical"
+    return "aerial drone cinematic vertical"
 
 
 def _fetch_one_clip(query: str, scene_idx: int, log_handler=None) -> str | None:
