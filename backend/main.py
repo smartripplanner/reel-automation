@@ -7,7 +7,6 @@ from fastapi.middleware.cors import CORSMiddleware
 from database import init_db
 from routes import automation, jobs, logs, reels, settings
 from schemas import HealthResponse, RootResponse
-from services.scheduler import start_scheduler, stop_scheduler
 
 
 @asynccontextmanager
@@ -18,21 +17,7 @@ async def lifespan(_: FastAPI):
     except Exception as exc:  # noqa: BLE001
         print(f"[Startup] WARNING: DB init failed — {exc}")
 
-    # ── Scheduler ───────────────────────────────────────────────────────────────
-    # Wrapped in try/except so a broken APScheduler install or import never
-    # prevents the FastAPI server from starting (CORS headers must reach clients).
-    try:
-        start_scheduler()
-    except Exception as exc:  # noqa: BLE001
-        print(f"[Startup] WARNING: Scheduler failed to start — {exc}")
-
     yield  # ── app is running ──
-
-    # ── Graceful shutdown ───────────────────────────────────────────────────────
-    try:
-        stop_scheduler()
-    except Exception:  # noqa: BLE001
-        pass
 
 
 app = FastAPI(title="Reel Automation Dashboard API", lifespan=lifespan)

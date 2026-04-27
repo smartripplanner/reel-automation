@@ -6,7 +6,6 @@ import { useJobPoller } from "./hooks/useJobPoller";
 import {
   generateBatchReels,
   generateReel,
-  generateReelJob,
   getAutomationStatus,
   getLogs,
   getReels,
@@ -78,11 +77,16 @@ function App() {
     });
   }, []);
 
-  // Refresh data when an async job finishes
+  // Refresh data + clear progress when an async job finishes
   useEffect(() => {
-    if (jobStatus === "completed" || jobStatus === "failed") {
+    if (jobStatus === "completed") {
       setBusy(false);
+      setBatchProgress("Reel generated successfully!");
       refreshData().catch(() => {});
+      window.setTimeout(() => setBatchProgress(""), 5000);
+    } else if (jobStatus === "failed") {
+      setBusy(false);
+      setBatchProgress("");
     }
   }, [jobStatus]);
 
@@ -100,30 +104,40 @@ function App() {
     }
   };
 
-  // Generate a single reel — dispatches to GitHub Actions, returns job_id instantly
-  const handleGenerate = async () => {
+  // Shared logic: kick off a reel job and start polling for completion.
+  // Both "Start Automation" and "Generate Reel" go through here.
+  const _startReelJob = async (apiFn) => {
     setBusy(true);
     setError("");
     clearJob();
-    setBatchProgress("Starting...");
+    setBatchProgress("Queuing reel...");
 
     try {
-      const data = await generateReel("Hidden gems in Europe");
-      const jobId = data.job_id ?? "unknown";
-      const jobStatus = data.status ?? "queued";
+      const data = await apiFn();
+      const jobId = data.job_id;
 
-      setBatchProgress(`Job ${jobStatus} — ID: ${jobId}`);
-      console.log("Generate response:", data);
+      if (!jobId) {
+        setBatchProgress("Job queued — check logs for progress.");
+        window.setTimeout(() => setBatchProgress(""), 6000);
+        setBusy(false);
+        return;
+      }
 
-      // Clear the progress banner after 8 s so it doesn't linger
-      window.setTimeout(() => setBatchProgress(""), 8000);
+      setBatchProgress("Pipeline started — generating reel...");
+      startJob(jobId); // begins polling GET /jobs/{jobId} every 3 s
+      // busy stays true; the jobStatus useEffect above clears it + refreshes data
     } catch (requestError) {
-      setError(extractErrorMessage(requestError, "Failed to start generation."));
+      setError(extractErrorMessage(requestError, "Failed to start reel generation."));
       setBatchProgress("");
-    } finally {
       setBusy(false);
     }
   };
+
+  // "Start Automation" — uses saved niche from Settings as topic
+  const handleStart = () => _startReelJob(startAutomation);
+
+  // "Generate Reel" — uses an explicit topic
+  const handleGenerate = () => _startReelJob(() => generateReel("Hidden gems in Europe"));
 
   const runBatchGeneration = async (count) => {
     setBusy(true);
@@ -223,7 +237,7 @@ function App() {
               logs={logs}
               busy={busy}
               batchProgress={batchProgress}
-              onStart={() => runAction(startAutomation)}
+              onStart={handleStart}
               onStop={() => runAction(stopAutomation)}
               onGenerate={handleGenerate}
               onGenerateBatch={() => runBatchGeneration(5)}

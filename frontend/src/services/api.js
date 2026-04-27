@@ -13,6 +13,7 @@ export const getAutomationStatus = async () => {
   return data;
 };
 
+// Returns { job_id, status } — backend queues the pipeline and returns immediately
 export const startAutomation = async () => {
   const { data } = await api.post("/automation/start");
   return data;
@@ -23,8 +24,8 @@ export const stopAutomation = async () => {
   return data;
 };
 
-// Trigger a single reel via GitHub Actions.
-// Returns { job_id, status } from the in-memory job tracker.
+// Trigger a single reel with an explicit topic.
+// Returns { job_id, status, topic } — pipeline runs in background.
 export const generateReel = async (topic = "Travel Tips & Hidden Gems") => {
   const { data } = await api.post("/automation/generate", { topic });
   return data;
@@ -55,13 +56,7 @@ export const updateSettings = async (payload) => {
   return data;
 };
 
-// ── Async reel generation (job-based, DB-backed) ─────────────────────────────
-
-export const generateReelJob = async () => {
-  const { data } = await api.post("/automation/generate-async");
-  return data; // { job_id, status, message }
-};
-
+// Poll a running job for live logs and final status
 export const getJobStatus = async (jobId) => {
   const { data } = await api.get(`/jobs/${jobId}`);
   return data; // { id, status, logs, result }
