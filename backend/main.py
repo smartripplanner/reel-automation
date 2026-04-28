@@ -25,14 +25,14 @@ from schemas import HealthResponse, RootResponse
 async def lifespan(_: FastAPI):
     # ── Database ────────────────────────────────────────────────────────────────
     try:
-        # init_db() creates all tables including the new "jobs" table
+        # init_db() creates all tables, enables WAL mode, and runs column migration
         init_db()
     except Exception as exc:
         print(f"[Startup] WARNING: DB init failed — {exc}")
 
     # ── Job recovery ────────────────────────────────────────────────────────────
     # Any job still "running" or "queued" from the previous process is now
-    # unreachable (background thread gone). Mark them failed so the frontend
+    # unreachable (worker subprocess gone). Mark them failed so the frontend
     # stops polling with 404s and shows a clear error message instead.
     try:
         from services.job_service import recover_stale_jobs
@@ -41,6 +41,21 @@ async def lifespan(_: FastAPI):
             print(f"[Startup] Recovered {recovered} stale job(s) → marked as failed")
     except Exception as exc:
         print(f"[Startup] WARNING: Job recovery failed — {exc}")
+
+    # ── Storage cleanup ──────────────────────────────────────────────────────────
+    # Remove orphan clips, temp segments, and old reels from crashed previous runs.
+    try:
+        from utils.cleanup import run_full_cleanup
+        summary = run_full_cleanup()
+        if summary.get("total", 0):
+            print(f"[Startup] Cleanup: removed {summary['clips']} clips, "
+                  f"{summary['reels']} old reels, {summary['temp']} temp files")
+    except Exception as exc:
+        print(f"[Startup] WARNING: Cleanup failed — {exc}")
+
+    # ── Log plan mode ─────────────────────────────────────────────────────────────
+    free_plan = os.getenv("FREE_PLAN", "false").lower() in ("true", "1", "yes")
+    print(f"[Startup] Plan: {'FREE_PLAN — 480p / veryfast / SRT captions' if free_plan else 'STANDARD — 720p / ultrafast / ASS captions'}")
 
     yield  # ── app is running ──
 

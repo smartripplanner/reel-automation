@@ -43,6 +43,7 @@ boto3>=1.34.0           # AWS S3 upload for the Cloud Bridge
 # ── Utilities ──────────────────────────────────────────────────────────────
 python-dotenv==1.0.1
 numpy>=1.24.0
+psutil>=5.9.0           # RAM monitoring for memory guard (memory_guard.py)
 
 # ── FFmpeg (system dependency — NOT a pip package) ─────────────────────────
 # Install FFmpeg separately:

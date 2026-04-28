@@ -38,27 +38,25 @@ from automation.format_router import build_pipeline_config
 from automation.media_engine import fetch_scene_clips, fetch_video_clips
 from automation.script_engine import generate_script, _emergency_hinglish_scenes
 from automation.scraper_engine import extract_top_hooks, pick_best_audio, scrape_trending_reels
+from automation.srt_engine import generate_srt
 from automation.topic_engine import generate_topic
 from automation.tts_engine import generate_voice, voice_file_exists
 from automation.video_engine import create_reel_video
+from utils.cleanup import run_full_cleanup
+from utils.memory_guard import log_ram, is_memory_critical, is_memory_emergency
 from utils.storage import BASE_DIR, ensure_storage_dirs
 
 MEDIA_FETCH_COUNT = 15  # kept for fallback fetch_video_clips calls
 
-# ── Memory budget constants ────────────────────────────────────────────────────
-# Render free tier: 512 MB RAM.  Target: stay under 400 MB at all times.
+# ── Plan-aware memory budget ───────────────────────────────────────────────────
+# FREE_PLAN=true  (Render free, 512 MB) : 480p, veryfast, SRT captions, 5 scenes
+# FREE_PLAN=false (Render paid / local)  : 720p, ultrafast, ASS captions, 5 scenes
 #
-# MAX_SCENES    : fetch and render up to 5 clips (one per script scene).
-#                 Each 720p clip is capped at 10 MB; 5 clips = ≤50 MB.
-#                 Phase 1 of the FFmpeg render is sequential (one clip at a time)
-#                 so peak RAM is ~1 clip decode at once, not all 5 simultaneously.
-# MAX_WORKERS   : 1 — no parallel media+audio fetch.
-#                 Parallel fetch held two large downloads in RAM simultaneously.
 # ENABLE_WHISPER: False — faster-whisper loads a 75 MB model into RAM exactly
-#                 when FFmpeg is also active. The combination always OOMs.
-#                 Captions are generated via estimate_word_timestamps() which
-#                 works purely from script text + audio duration, no model needed.
-#                 Re-enable only on plans with 1 GB+ RAM.
+#   when FFmpeg is also active. The combination always OOMs on free plan.
+#   Captions use estimate_word_timestamps() instead — zero model downloads.
+#   Re-enable only on plans with 1 GB+ RAM.
+_FREE_PLAN     = os.getenv("FREE_PLAN", "false").lower() in ("true", "1", "yes")
 MAX_SCENES     = 5
 MAX_WORKERS    = 1
 ENABLE_WHISPER = False
@@ -212,7 +210,9 @@ def run_pipeline(
     log_handler=None,
 ) -> dict:
     ensure_storage_dirs()
+    run_full_cleanup(log_handler)          # evict orphan clips/segments first
     resolved_topic = topic or category_hint or "general"
+    log_ram("Pipeline start", log_handler)
 
     try:
         # ── Stage 0: Trend scrape (parallel with script generation) ───────────
@@ -249,6 +249,7 @@ def run_pipeline(
         gc.collect()
 
         resolved_topic = topic_payload["topic"]
+        log_ram("After script generation", log_handler)
 
         # Emergency guard — should never fire; script_engine already handles this
         if not script_payload.get("text", "").strip():
@@ -320,6 +321,7 @@ def run_pipeline(
 
         if not voice_path or not voice_file_exists(voice_path):
             raise RuntimeError("Audio generation produced no audio file.")
+        log_ram("After TTS", log_handler)
 
         # Media fetch second — sequential, one clip at a time (already sequential inside)
         if scenes:
@@ -328,6 +330,7 @@ def run_pipeline(
             clip_paths = fetch_video_clips(resolved_topic, log_handler, count=MAX_SCENES)
         clip_paths = [p for p in clip_paths if (BASE_DIR / Path(p)).exists()]
         gc.collect()
+        log_ram("After media fetch", log_handler)
 
         if not clip_paths:
             _log(log_handler, "No scene clips found — retrying with topic")
@@ -335,40 +338,70 @@ def run_pipeline(
             clip_paths = [p for p in clip_paths if (BASE_DIR / Path(p)).exists()]
 
         # ── Stage 3a: Captions (estimation-based — no Whisper required) ──────────
-        # generate_captions() calls transcribe_audio() which returns [] when
-        # faster-whisper is not installed, then write_ass_subtitles() falls back
-        # to estimate_word_timestamps() — distributing script words proportionally
-        # across the audio duration. Zero model downloads, ~0 extra RAM.
-        # Captions are only meaningful for TTS voice (text_music has no narrator).
+        #
+        # Plan routing:
+        #   FREE_PLAN=true  → SRT subtitles  (lighter, no libass style calc)
+        #   FREE_PLAN=false → ASS subtitles  (yellow keyword highlights)
+        #
+        # Memory guard: if RAM is already critical (>420 MB), skip subtitles
+        # entirely — the pipeline still produces a valid video, just without
+        # burned-in captions.  This is the last resort before an OOM crash.
+        #
+        # Both paths use estimate_word_timestamps() — zero model downloads.
         ass_path: str | None = None
-        if use_tts:
-            audio_abs = str(BASE_DIR / Path(voice_path))
+        srt_path: str | None = None
+
+        if not use_tts:
+            _log(log_handler, "[Captions] Skipped (text_music format — no TTS voice)")
+        elif is_memory_critical():
+            _log(log_handler, "[Captions] Skipped — RAM critical, conserving memory before FFmpeg")
+        else:
+            audio_abs      = str(BASE_DIR / Path(voice_path))
             audio_duration = _get_audio_duration(voice_path)
+            import tempfile as _tmpmod
             try:
-                import tempfile as _tmpmod
-                tmp_fd, tmp_ass = _tmpmod.mkstemp(suffix=".ass")
-                os.close(tmp_fd)
-                ass_path = generate_captions(
-                    audio_path=audio_abs,
-                    output_ass_path=tmp_ass,
-                    script_text=display_text,
-                    audio_duration=audio_duration,
-                    hook_duration=2.0,
-                    log_handler=log_handler,
-                ) or None
-                if ass_path:
-                    try:
-                        n_lines = sum(1 for _ in open(ass_path, encoding="utf-8"))
-                    except Exception:
-                        n_lines = 0
-                    _log(log_handler, f"[Captions] ASS subtitles ready ({n_lines} lines)")
+                if _FREE_PLAN:
+                    # SRT path — lightweight, no libass style overhead
+                    tmp_fd, tmp_srt = _tmpmod.mkstemp(suffix=".srt")
+                    os.close(tmp_fd)
+                    srt_path = generate_srt(
+                        script_text=display_text,
+                        audio_duration=audio_duration,
+                        output_path=tmp_srt,
+                        hook_duration=2.0,
+                        log_handler=log_handler,
+                    ) or None
+                else:
+                    # ASS path — yellow highlights, styled captions
+                    tmp_fd, tmp_ass = _tmpmod.mkstemp(suffix=".ass")
+                    os.close(tmp_fd)
+                    ass_path = generate_captions(
+                        audio_path=audio_abs,
+                        output_ass_path=tmp_ass,
+                        script_text=display_text,
+                        audio_duration=audio_duration,
+                        hook_duration=2.0,
+                        log_handler=log_handler,
+                    ) or None
+                    if ass_path:
+                        try:
+                            n_lines = sum(1 for _ in open(ass_path, encoding="utf-8"))
+                        except Exception:
+                            n_lines = 0
+                        _log(log_handler, f"[Captions] ASS ready ({n_lines} lines)")
             except Exception as cap_exc:
                 _log(log_handler, f"[Captions] Skipped: {cap_exc}")
                 ass_path = None
-        else:
-            _log(log_handler, "[Captions] Skipped (text_music format — no TTS voice)")
+                srt_path = None
 
         gc.collect()   # free audio buffers before FFmpeg starts
+        log_ram("Before FFmpeg", log_handler)
+
+        # Emergency guard: if RAM is still above 460 MB, drop to 360p to survive
+        if is_memory_emergency():
+            _log(log_handler, "[Memory] EMERGENCY — RAM >460 MB; dropping subtitles + forcing minimal encode")
+            ass_path = None
+            srt_path = None
 
         # ── Stage 3b: Video render ────────────────────────────────────────────
         reel_path = create_reel_video(
@@ -376,17 +409,20 @@ def run_pipeline(
             audio_path=voice_path,
             script_text=display_text,
             ass_path=ass_path,
+            srt_path=srt_path,
             log_handler=log_handler,
         )
         gc.collect()
+        log_ram("After render", log_handler)
         _log(log_handler, "Reel saved")
 
-        # Clean up the temporary ASS file now that it's burned in
-        if ass_path:
-            try:
-                Path(ass_path).unlink(missing_ok=True)
-            except Exception:
-                pass
+        # Clean up temporary subtitle files now that they are burned in
+        for sub_file in (ass_path, srt_path):
+            if sub_file:
+                try:
+                    Path(sub_file).unlink(missing_ok=True)
+                except Exception:
+                    pass
 
         # ── Delete scene clip files — they are no longer needed ───────────────
         # video_engine._ffmpeg_render_low_mem() already deletes source clips

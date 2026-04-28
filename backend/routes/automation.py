@@ -8,10 +8,10 @@ from database import get_db
 from schemas import AutomationStatusResponse, BatchGenerateRequest, BatchGenerateResponse
 from services import job_service
 from services.automation_service import (
-    _run_pipeline_as_job,
     generate_batch_reels,
     get_status,
     run_generate_job,
+    spawn_worker,
     stop_automation,
 )
 from utils.logger import log_message
@@ -48,21 +48,20 @@ async def stop_automation_route(db: Session = Depends(get_db)):
 @router.post("/generate")
 def generate_reel_route(
     req: GenerateRequest,
-    background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
 ):
     """
     Generate one reel with an explicit topic.
 
-    Same pipeline as /start but lets the caller specify the topic directly
-    instead of reading it from DB settings.  Returns job_id immediately.
-    Poll GET /jobs/{job_id} for progress.
+    Spawns an isolated worker subprocess immediately — the server is never
+    blocked by the pipeline and cannot be OOM-killed by FFmpeg rendering.
+    Poll GET /jobs/{job_id} for live progress and final status.
     """
-    job_id = job_service.create_job()
-    log_message(db, f"Manual reel queued — topic: {req.topic!r} | job_id={job_id}")
+    job_id = job_service.create_job(topic=req.topic)
+    log_message(db, f"Manual reel queued (subprocess) — topic: {req.topic!r} | job_id={job_id}")
     logger.info(f"[Generate] job_id={job_id} topic={req.topic!r}")
-    background_tasks.add_task(_run_pipeline_as_job, job_id, req.topic)
-    return {"job_id": job_id, "status": "queued", "topic": req.topic}
+    pid = spawn_worker(job_id, topic=req.topic)
+    return {"job_id": job_id, "status": "queued", "topic": req.topic, "worker_pid": pid}
 
 
 @router.post("/generate-batch", response_model=BatchGenerateResponse)

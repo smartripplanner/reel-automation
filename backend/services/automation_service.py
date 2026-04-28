@@ -1,8 +1,11 @@
 import asyncio
 import os
+import subprocess
+import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
+from pathlib import Path
 
 from fastapi import BackgroundTasks
 from sqlalchemy.orm import Session
@@ -14,6 +17,9 @@ from services import job_service
 from services.reel_service import create_reel
 from services.settings_service import get_or_create_settings
 from utils.logger import log_message, log_message_safe
+
+# Path to the standalone worker script (same directory as this file's parent)
+_WORKER_SCRIPT = Path(__file__).parent.parent / "worker.py"
 
 
 automation_state = {
@@ -167,92 +173,83 @@ def get_status() -> AutomationStatusResponse:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Async job — returns job_id immediately, runs pipeline in background thread
+# Subprocess worker — isolates the pipeline from the FastAPI server process
 # ─────────────────────────────────────────────────────────────────────────────
+
+def spawn_worker(job_id: str, category: str = "", topic: str = "") -> int:
+    """
+    Spawn worker.py as an isolated child process and return its PID.
+
+    The worker writes all status updates and logs directly to SQLite, so the
+    FastAPI server can serve them via GET /jobs/{id} without any shared memory.
+
+    If the worker OOMs (FFmpeg decode spike), the OS kills the child first
+    (highest RSS → highest OOM score) while the FastAPI server stays alive.
+    On the next request the user gets a clean "failed" status instead of a
+    server crash loop.
+
+    The worker inherits the full environment (all .env variables) so
+    PEXELS_API_KEY, GEMINI_API_KEY, FREE_PLAN, etc. are all available.
+    """
+    cmd = [sys.executable, str(_WORKER_SCRIPT), "--job-id", job_id]
+    if category:
+        cmd += ["--category", category]
+    if topic:
+        cmd += ["--topic", topic]
+
+    proc = subprocess.Popen(
+        cmd,
+        env=os.environ.copy(),
+        close_fds=True,
+        # Pipe stdout/stderr so Render captures worker logs in the same log stream
+        stdout=None,   # inherit parent stdout → Render log stream
+        stderr=None,   # inherit parent stderr → Render log stream
+    )
+    print(f"[AutomationService] Worker spawned pid={proc.pid} job_id={job_id}", flush=True)
+    return proc.pid
+
 
 def _run_pipeline_as_job(job_id: str, topic_override: str | None = None) -> None:
     """
-    Background thread: run the full pipeline and store the result in job_service.
+    Spawn a worker subprocess for this job.
 
-    Parameters
-    ----------
-    job_id         : ID of the job record created by job_service.create_job()
-    topic_override : Optional explicit topic string injected by the APScheduler.
-                     When set, bypasses settings.niche and uses this topic directly.
-                     Allows the scheduler to pass specific South East Asia sub-topics
-                     without modifying the user's saved settings.
+    Called by:
+      - run_generate_job() via FastAPI BackgroundTasks (non-blocking)
+      - trigger_sequential_batch() for each batch slot
 
-    Thread-safety note
-    ──────────────────
-    run_pipeline() uses ThreadPoolExecutor internally (Stage 2: audio + media
-    fetch run in parallel).  Both worker threads call log_handler(), which
-    previously wrote to a shared SQLAlchemy session via db.commit().
+    The BackgroundTask wrapper exits immediately after spawn_worker() returns,
+    so the FastAPI event loop is never blocked by the pipeline.
 
-    Root cause of the crash: SQLAlchemy 2.0 sessions are NOT thread-safe.
-    A shared session that starts a commit on thread A can land in a CLOSED /
-    COMMITTING state that poisons all subsequent commit() calls — even those
-    waiting behind a threading.Lock — producing the misleading error:
-        "Method 'commit()' can't be called here; already in progress"
-
-    Fix: log_message_safe() opens a brand-new session for every log write and
-    closes it before returning, so no session state is ever shared between
-    threads.  A module-level lock inside log_message_safe serialises the
-    SQLite writes without any shared-session risk.  The main `db` session is
-    reserved for the non-parallel parts of the function (settings read and
-    reel record creation).
+    For the batch path, spawn_worker() returns synchronously so the caller can
+    choose to wait for completion or not.  Currently batch dispatches to GitHub
+    Actions so subprocess isolation is less critical, but kept for consistency.
     """
-    job_service.set_running(job_id)
-
     db = SessionLocal()
-
     try:
         settings = get_or_create_settings(db)
-
-        # topic_override (from scheduler) takes priority over saved settings.niche
-        category_hint = topic_override or settings.niche
-
-        def _log(msg: str) -> None:
-            # Forward to in-memory job log immediately (no lock needed)
-            job_service.append_log(job_id, msg)
-            # Each DB write gets its own isolated session — fully thread-safe
-            log_message_safe(msg)
-
-        if topic_override:
-            _log(f"[Scheduler] Topic override active: '{topic_override}'")
-
-        pipeline_result = run_pipeline(
-            category_hint=category_hint,
-            log_handler=_log,
-        )
-
-        file_path = pipeline_result.get("file_path") or "storage/reels/unavailable.mp4"
-        caption = pipeline_result.get("caption") or "Auto-generated reel"
-        status = pipeline_result.get("status", "completed")
-
-        reel = create_reel(db=db, file_path=file_path, caption=caption, status=status)
-
-        automation_state["last_run_at"] = datetime.utcnow()
-        job_service.set_completed(job_id, {
-            "status": status,
-            "file_path": file_path,
-            "caption": caption,
-            "topic": pipeline_result.get("topic", ""),
-            "reel_id": reel.id,
-        })
-    except Exception as exc:
-        job_service.set_failed(job_id, str(exc))
+        category = topic_override or settings.niche or ""
+        topic    = topic_override or ""
     finally:
         db.close()
+
+    spawn_worker(job_id, category=category if not topic_override else "",
+                 topic=topic)
+    automation_state["last_run_at"] = datetime.utcnow()
 
 
 def run_generate_job(background_tasks: BackgroundTasks, db: Session) -> GenerateJobResponse:
     """
     Queue a reel-generation job.  Returns immediately with job_id.
     The caller polls GET /jobs/{job_id} for updates.
+
+    The actual pipeline runs in an isolated subprocess (worker.py) so an
+    OOM kill during FFmpeg rendering cannot bring down the FastAPI server.
     """
-    job_id = job_service.create_job()
-    log_message(db, f"Async reel job queued: {job_id}")
-    background_tasks.add_task(_run_pipeline_as_job, job_id)
+    settings = get_or_create_settings(db)
+    category = settings.niche or ""
+    job_id   = job_service.create_job(topic=category)
+    log_message(db, f"Async reel job queued (subprocess): {job_id}")
+    background_tasks.add_task(spawn_worker, job_id, category=category)
     return GenerateJobResponse(job_id=job_id)
 
 

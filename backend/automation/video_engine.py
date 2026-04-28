@@ -44,30 +44,49 @@ from utils.storage import BASE_DIR, MUSIC_DIR, REELS_DIR, ensure_storage_dirs, t
 ensure_pillow_compat()
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Constants
+# Plan-aware constants
 # ─────────────────────────────────────────────────────────────────────────────
+#
+# Set FREE_PLAN=true in Render environment to enable the 480×854 / veryfast
+# / 700k mode.  Unset (or false) → 720×1280 / ultrafast / 1M (default).
+#
+# FREE_PLAN differences:
+#   Resolution  : 480×854   vs 720×1280  (56% fewer pixels → smaller decode buffers)
+#   Preset      : veryfast  vs ultrafast (veryfast compresses better at same speed)
+#   Bitrate     : 700k      vs 1M        (smaller output file, less write I/O)
+#   Max-rate    : 900k      vs 1500k
+#   Buffer      : 900k      vs 1500k
+#
+# NOTE: ultrafast uses LESS CPU but MORE bitrate to hit the same quality.
+#       veryfast uses slightly more CPU but produces a smaller file.
+#       On Render free plan the bottleneck is RAM, not CPU, so veryfast is
+#       the better choice for staying under 512 MB.
 
-# ── Render resolution ─────────────────────────────────────────────────────────
-# 720×1280 instead of 1080×1920.
-# Reduces per-frame memory 2.25× and FFmpeg buffer sizes proportionally.
-# Instagram accepts 720p reels without quality penalty.
-FRAME_W, FRAME_H = 720, 1280
+_FREE_PLAN = os.getenv("FREE_PLAN", "false").lower() in ("true", "1", "yes")
 
-FPS = 24                      # 24fps vs 30fps → 20% fewer frames per second
+if _FREE_PLAN:
+    FRAME_W, FRAME_H = 480, 854
+    _PRESET      = "veryfast"
+    _CRF         = "30"
+    _VIDEO_BRATE = "700k"
+    _MAX_RATE    = "900k"
+    _BUF_SIZE    = "900k"
+    _AUDIO_BRATE = "96k"
+else:
+    FRAME_W, FRAME_H = 720, 1280
+    _PRESET      = "ultrafast"
+    _CRF         = "28"
+    _VIDEO_BRATE = "1M"
+    _MAX_RATE    = "1500k"
+    _BUF_SIZE    = "1500k"
+    _AUDIO_BRATE = "96k"
+
+FPS = 24                      # 24fps — 20% fewer frames than 30fps
 HOOK_DURATION = 2.0
 SAFE_X = int(FRAME_W * 0.07)
 SAFE_Y = int(FRAME_H * 0.10)
 MUSIC_VOLUME = 0.08
 TEMP_RENDER_ROOT = BASE_DIR / "storage" / "tmp"
-
-# ── Memory budget flags ────────────────────────────────────────────────────────
-# These constants are read by _ffmpeg_render_low_mem and callers.
-_PRESET      = "ultrafast"    # minimal encode memory vs "fast" / "medium"
-_CRF         = "28"           # quality 28 = good enough for 720p social
-_VIDEO_BRATE = "1M"           # target bitrate — keeps output files small
-_MAX_RATE    = "1500k"        # ceiling
-_BUF_SIZE    = "1500k"        # VBV buffer — small = small encoder RAM
-_AUDIO_BRATE = "96k"          # voice-only reels don't need 128k
 _SCENE_LIMIT = 5              # render at most 5 scenes (one per script scene)
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -358,6 +377,7 @@ def _ffmpeg_render_low_mem(
     output_path: str,
     total_duration: float,
     ass_path: str | None = None,
+    srt_path: str | None = None,
     log_handler=None,
 ) -> bool:
     """
@@ -489,17 +509,25 @@ def _ffmpeg_render_low_mem(
             f"adelay=500|500,atempo=1.25,apad[final_a]"
         )
 
-        # When an ASS file is available, burn subtitles during this existing
-        # re-encode pass (no extra pass = no extra RAM cost).
-        # When absent, pass the video stream through without any video filter.
-        use_subtitles = bool(ass_path and Path(ass_path).exists())
+        # Subtitle burn-in during this existing re-encode pass (no extra pass).
+        # Priority: ASS (paid plan, yellow highlights) > SRT (free plan) > none.
+        # Both use FFmpeg's `subtitles=` filter with libass — the difference is
+        # only in the file format and styling complexity.
+        use_ass = bool(ass_path and Path(ass_path).exists())
+        use_srt = bool(not use_ass and srt_path and Path(srt_path).exists())
 
-        if use_subtitles:
+        if use_ass:
             escaped = _escape_ass_path(ass_path)
             video_chain = f"[0:v]ass=filename='{escaped}'[final_v]"
             full_filter = f"{video_chain};{audio_chain}"
             video_map = "[final_v]"
-            _log(log_handler, "[Render] Burning ASS subtitles in Phase 2 pass")
+            _log(log_handler, "[Render] Burning ASS subtitles (paid mode)")
+        elif use_srt:
+            escaped = _escape_ass_path(srt_path)   # same escaping rules apply
+            video_chain = f"[0:v]subtitles=filename='{escaped}'[final_v]"
+            full_filter = f"{video_chain};{audio_chain}"
+            video_map = "[final_v]"
+            _log(log_handler, "[Render] Burning SRT subtitles (free plan mode)")
         else:
             full_filter = audio_chain
             video_map = "0:v"
@@ -746,6 +774,7 @@ def create_reel_video(
     audio_path: str,
     script_text: str,
     ass_path: str | None = None,
+    srt_path: str | None = None,
     log_handler=None,
     hook_text: str | None = None,
 ) -> str:
@@ -755,22 +784,20 @@ def create_reel_video(
     Strategy
     ────────
     1. FFmpeg low-memory path (sequential segments → concat demuxer)
-       Peak RAM: ~120-160 MB. Target: sub-400 MB total process.
-       ASS subtitles are burned in during the existing Phase 2 re-encode
-       pass — no extra pass, no extra memory cost.
+       Peak RAM: ~80-160 MB. Target: sub-400 MB total process.
+       Subtitles burned in during the existing Phase 2 re-encode pass —
+       no extra pass, no extra memory cost.
     2. MoviePy fallback only if FFmpeg is not on PATH.
-       (MoviePy loads all clips into Python RAM — avoid on Render free tier)
 
-    Resolution : 720×1280  (down from 1080×1920)
-    Preset     : ultrafast (down from fast)
-    Bitrate    : 1 Mbit/s  (down from 8 Mbit/s)
-    Scenes     : 5 max     (one per script scene)
-    Subtitles  : burned in via ASS filter (estimation-based, no Whisper)
+    FREE_PLAN=true  : 480×854, veryfast, 700k, SRT subtitles
+    FREE_PLAN=false : 720×1280, ultrafast, 1M, ASS subtitles (default)
     """
     import gc
+    from utils.memory_guard import log_ram
+
     ensure_storage_dirs()
 
-    # Enforce scene limit before touching FFmpeg — each extra clip costs ~50 MB
+    # Enforce scene limit before touching FFmpeg — each extra clip costs RAM
     working_clips = [p for p in clip_paths[:_SCENE_LIMIT]
                      if (BASE_DIR / Path(p)).exists()]
 
@@ -786,18 +813,24 @@ def create_reel_video(
     if probed > 0:
         total_duration = (probed / _ATEMPO) + _DELAY_S + _BUFFER_S
 
+    plan_label = "FREE_PLAN 480p/veryfast/700k" if _FREE_PLAN else "720p/ultrafast/1M"
+    sub_label  = "ASS" if ass_path else ("SRT" if srt_path else "no captions")
+    log_ram("Before FFmpeg render", log_handler)
+
     if _ffmpeg_available():
-        sub_label = "with ASS captions" if ass_path else "no captions"
-        _log(log_handler, f"[Render] 720p / ultrafast / 1M / {len(working_clips)} scenes / {sub_label}")
+        _log(log_handler,
+             f"[Render] {plan_label} / {len(working_clips)} scenes / {sub_label} subtitles")
         success = _ffmpeg_render_low_mem(
             clip_paths=working_clips,
             audio_path=audio_path,
             output_path=output_path,
             total_duration=total_duration,
             ass_path=ass_path,
+            srt_path=srt_path,
             log_handler=log_handler,
         )
         gc.collect()
+        log_ram("After FFmpeg render", log_handler)
         if success:
             _log(log_handler, "Video rendered [FFmpeg low-mem]")
             return to_storage_relative(Path(output_path))
