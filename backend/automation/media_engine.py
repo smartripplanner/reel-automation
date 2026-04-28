@@ -400,21 +400,40 @@ def _aerial_suffix(query: str) -> str:
     """
     Suffix appended to every Pexels scene query.
 
+    For outdoor / landscape scenes: appends "aerial drone cinematic vertical"
+    which surfaces B-roll-style footage ideal for travel/lifestyle reels.
+
+    For indoor / people-focused scenes: "aerial drone" returns irrelevant
+    outdoor shots.  For those queries we use "cinematic vertical" only so
+    Pexels returns the most visually relevant indoor footage.
+
     Previously used '4k aerial drone cinematic vertical' which forced Pexels
     to return 4K UHD clips (50-80 MB each).  Removing '4k' lets Pexels serve
-    HD/720p clips (3-10 MB) which are perfectly fine for a 720×1280 output
-    and fit comfortably within the Render free-tier memory budget.
+    HD/720p clips (3-10 MB) which are perfectly fine for a 720×1280 output.
     """
+    query_lower = query.lower()
+    if any(kw in query_lower for kw in _INDOOR_KEYWORDS):
+        return "cinematic vertical"
     return "aerial drone cinematic vertical"
 
 
-def _fetch_one_clip(query: str, scene_idx: int, log_handler=None) -> str | None:
+def _fetch_one_clip(
+    query: str,
+    scene_idx: int,
+    log_handler=None,
+    used_ids: set | None = None,
+) -> str | None:
     """
     Fetch exactly one HD MP4 from Pexels for a single scene query.
 
     Tries up to two passes:
-      Pass 1 — query + aerial suffix (for outdoor/landscape scenes)
+      Pass 1 — query + aerial/cinematic suffix (context-aware)
       Pass 2 — bare query only (fallback when aerial returns 0 results)
+
+    `used_ids` is a shared set of already-downloaded Pexels video IDs.
+    Videos whose ID is in `used_ids` are skipped so each scene gets a
+    visually distinct clip.  The set is mutated in-place on success.
+
     Returns a storage-relative path on success, None on failure.
     """
     pexels_api_key = os.getenv("PEXELS_API_KEY")
@@ -427,7 +446,7 @@ def _fetch_one_clip(query: str, scene_idx: int, log_handler=None) -> str | None:
         f"{query} {suffix}".strip(),   # pass 1: with aerial/cinematic suffix
         query.strip(),                  # pass 2: bare query only
     ]
-    # De-duplicate (aerial suffix already absent for indoor queries)
+    # De-duplicate (suffix already absent for indoor queries)
     if search_queries[0] == search_queries[1]:
         search_queries = [search_queries[0]]
 
@@ -437,11 +456,11 @@ def _fetch_one_clip(query: str, scene_idx: int, log_handler=None) -> str | None:
         _log(log_handler, f"{label} pass {attempt}: '{search_query}'")
         try:
             response = requests.get(
-                "https://api.pexels.com/videos/search",   # videos endpoint, NOT /v1/search
+                "https://api.pexels.com/videos/search",
                 headers={"Authorization": pexels_api_key},
                 params={
                     "query": search_query,
-                    "per_page": 8,
+                    "per_page": 12,          # fetch more results so dedup has room
                     "orientation": "portrait",
                     "size": "large",
                 },
@@ -452,6 +471,13 @@ def _fetch_one_clip(query: str, scene_idx: int, log_handler=None) -> str | None:
             _log(log_handler, f"{label}: {len(videos)} results")
 
             for video in videos:
+                video_id = video.get("id")
+
+                # Skip already-used video IDs to prevent repeated clips
+                if used_ids is not None and video_id in used_ids:
+                    _log(log_handler, f"{label}: skipping video {video_id} (already used)")
+                    continue
+
                 video_files = video.get("video_files", [])
                 link = _pick_mp4_link(video_files, log_handler)
                 if not link:
@@ -463,6 +489,9 @@ def _fetch_one_clip(query: str, scene_idx: int, log_handler=None) -> str | None:
                 output_path = VIDEOS_DIR / file_name
                 try:
                     _download_video(link, output_path, log_handler)
+                    # Mark this video as used before returning
+                    if used_ids is not None and video_id:
+                        used_ids.add(video_id)
                     _log(log_handler,
                          f"{label} OK — {file_name} "
                          f"({output_path.stat().st_size // 1024} KB)")
@@ -481,21 +510,24 @@ def fetch_scene_clips(scenes: list[dict], log_handler=None) -> list[str]:
     """
     Fetch exactly ONE portrait HD video per scene's search_query.
 
-    Returns a list of clip paths, one per scene. Falls back to placeholder
-    clips for any scene where Pexels returns no results.
+    Video ID deduplication is enforced across all scenes — each Pexels
+    video can appear at most once in the reel, guaranteeing visual variety.
+
+    Returns a list of clip paths, one per scene (placeholder used as fallback).
     """
     ensure_storage_dirs()
     clip_paths: list[str] = []
+    used_ids: set[int] = set()   # shared across scenes to prevent duplicate clips
 
     for i, scene in enumerate(scenes):
         query = scene.get("search_query", "cinematic aesthetic")
-        path = _fetch_one_clip(query, i, log_handler)
+        path = _fetch_one_clip(query, i, log_handler, used_ids=used_ids)
         if path:
             clip_paths.append(path)
         else:
-            _log(log_handler, f"Scene {i + 1}: placeholder (no results for '{query}')")
+            _log(log_handler, f"Scene {i + 1}: placeholder (no unique results for '{query}')")
             placeholder = _create_placeholder_clips(1)
             clip_paths.extend(placeholder)
 
-    _log(log_handler, f"Fetched {len(clip_paths)} scene clips")
+    _log(log_handler, f"Fetched {len(clip_paths)} scene clips ({len(used_ids)} unique Pexels IDs)")
     return clip_paths

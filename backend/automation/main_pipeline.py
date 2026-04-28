@@ -48,14 +48,18 @@ MEDIA_FETCH_COUNT = 15  # kept for fallback fetch_video_clips calls
 # ── Memory budget constants ────────────────────────────────────────────────────
 # Render free tier: 512 MB RAM.  Target: stay under 400 MB at all times.
 #
-# MAX_SCENES    : fetch and render at most 3 clips (not 5).
-#                 Each 720p clip is ~5-10 MB; 3 clips = ~15-30 MB vs 5 clips = ~50 MB.
+# MAX_SCENES    : fetch and render up to 5 clips (one per script scene).
+#                 Each 720p clip is capped at 10 MB; 5 clips = ≤50 MB.
+#                 Phase 1 of the FFmpeg render is sequential (one clip at a time)
+#                 so peak RAM is ~1 clip decode at once, not all 5 simultaneously.
 # MAX_WORKERS   : 1 — no parallel media+audio fetch.
 #                 Parallel fetch held two large downloads in RAM simultaneously.
 # ENABLE_WHISPER: False — faster-whisper loads a 75 MB model into RAM exactly
 #                 when FFmpeg is also active. The combination always OOMs.
-#                 Re-enable once moved to a plan with 1 GB+ RAM.
-MAX_SCENES     = 3
+#                 Captions are generated via estimate_word_timestamps() which
+#                 works purely from script text + audio duration, no model needed.
+#                 Re-enable only on plans with 1 GB+ RAM.
+MAX_SCENES     = 5
 MAX_WORKERS    = 1
 ENABLE_WHISPER = False
 
@@ -330,35 +334,43 @@ def run_pipeline(
             clip_paths = fetch_video_clips(resolved_topic, log_handler, count=MAX_SCENES)
             clip_paths = [p for p in clip_paths if (BASE_DIR / Path(p)).exists()]
 
-        # ── Stage 3: Render ───────────────────────────────────────────────────
-        # Whisper (faster-whisper) is DISABLED — it loads a 75 MB model exactly
-        # when FFmpeg is also running, pushing Render free tier over 512 MB.
-        # Re-enable ENABLE_WHISPER=True when running on 1 GB+ RAM.
-        if ENABLE_WHISPER and pipeline_cfg.get("use_whisper"):
+        # ── Stage 3a: Captions (estimation-based — no Whisper required) ──────────
+        # generate_captions() calls transcribe_audio() which returns [] when
+        # faster-whisper is not installed, then write_ass_subtitles() falls back
+        # to estimate_word_timestamps() — distributing script words proportionally
+        # across the audio duration. Zero model downloads, ~0 extra RAM.
+        # Captions are only meaningful for TTS voice (text_music has no narrator).
+        ass_path: str | None = None
+        if use_tts:
             audio_abs = str(BASE_DIR / Path(voice_path))
             audio_duration = _get_audio_duration(voice_path)
-            ass_path: str | None = None
             try:
-                with tempfile.NamedTemporaryFile(suffix=".ass", delete=False, mode="w") as tmp:
-                    tmp_ass = tmp.name
+                import tempfile as _tmpmod
+                tmp_fd, tmp_ass = _tmpmod.mkstemp(suffix=".ass")
+                os.close(tmp_fd)
                 ass_path = generate_captions(
                     audio_path=audio_abs,
                     output_ass_path=tmp_ass,
                     script_text=display_text,
                     audio_duration=audio_duration,
-                    hook_duration=0.0,
+                    hook_duration=2.0,
                     log_handler=log_handler,
                 ) or None
+                if ass_path:
+                    try:
+                        n_lines = sum(1 for _ in open(ass_path, encoding="utf-8"))
+                    except Exception:
+                        n_lines = 0
+                    _log(log_handler, f"[Captions] ASS subtitles ready ({n_lines} lines)")
             except Exception as cap_exc:
-                _log(log_handler, f"Caption generation skipped: {cap_exc}")
+                _log(log_handler, f"[Captions] Skipped: {cap_exc}")
                 ass_path = None
         else:
-            ass_path = None
-            if not ENABLE_WHISPER:
-                _log(log_handler, "[Memory] Whisper disabled — subtitles skipped")
+            _log(log_handler, "[Captions] Skipped (text_music format — no TTS voice)")
 
         gc.collect()   # free audio buffers before FFmpeg starts
 
+        # ── Stage 3b: Video render ────────────────────────────────────────────
         reel_path = create_reel_video(
             clip_paths=clip_paths,
             audio_path=voice_path,
@@ -368,6 +380,13 @@ def run_pipeline(
         )
         gc.collect()
         _log(log_handler, "Reel saved")
+
+        # Clean up the temporary ASS file now that it's burned in
+        if ass_path:
+            try:
+                Path(ass_path).unlink(missing_ok=True)
+            except Exception:
+                pass
 
         # ── Delete scene clip files — they are no longer needed ───────────────
         # video_engine._ffmpeg_render_low_mem() already deletes source clips

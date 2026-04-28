@@ -49,16 +49,16 @@ class WordStamp:
 @dataclass
 class CaptionStyle:
     font_name: str = "Arial Black"
-    font_size: int = 70              # 1080p (1080×1920) — exactly half of the 4K value (140)
+    font_size: int = 47              # 720p (720×1280) — scaled from 1080p value (70 × 720/1080 ≈ 47)
     primary_colour: str = "&H00FFFFFF"   # white  (ASS = &HAABBGGRR)
     outline_colour: str = "&H00000000"   # black
     back_colour: str = "&H00000000"      # unused with BorderStyle=1
     bold: bool = True
-    outline_size: int = 4            # 1080p outline — half of 4K value (8)
-    shadow_depth: int = 2            # 1080p shadow — half of 4K value (4)
+    outline_size: int = 3            # 720p outline — scaled from 1080p value (4 × 0.667 ≈ 3)
+    shadow_depth: int = 1            # 720p shadow — scaled from 1080p value (2 × 0.667 ≈ 1)
     alignment: int = 5               # centre-screen for high-impact reel captions
-    margin_v: int = 150              # 1080p lower-third safe zone — half of 4K value (300)
-    margin_lr: int = 60              # left/right safe-zone margin (unchanged — already 1080p-safe)
+    margin_v: int = 100              # 720p lower-third safe zone — scaled from 1080p value (150 × 0.667 ≈ 100)
+    margin_lr: int = 40              # 720p left/right safe-zone margin — scaled from 1080p value (60 × 0.667 ≈ 40)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -485,8 +485,8 @@ def _group_words_into_phrases(
 _ASS_HEADER_TEMPLATE = """\
 [Script Info]
 ScriptType: v4.00+
-PlayResX: 1080
-PlayResY: 1920
+PlayResX: 720
+PlayResY: 1280
 WrapStyle: 1
 ScaledBorderAndShadow: yes
 
@@ -497,6 +497,35 @@ Style: Caption,{font},{size},{primary},{secondary},{outline},{back},{bold},0,0,0
 [Events]
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 """
+
+
+def _highlight_phrase(text: str) -> str:
+    """
+    Apply yellow ASS colour tag to the longest (most visually important) word
+    in a phrase while leaving the remaining words white.
+
+    ASS colour format: &HAABBGGRR (A=alpha, B=blue, G=green, R=red).
+    Yellow = B:00 G:FF R:FF → &H0000FFFF   (opaque, no blue, full green+red).
+    After the highlighted word, reset to the style's primary white: &H00FFFFFF.
+
+    The `{\c}` reset tag (no value) restores the style's PrimaryColour, so we
+    don't hard-code the white value a second time — safer if the style changes.
+    """
+    words = text.split()
+    if not words:
+        return text
+
+    # Pick the longest word as the keyword to highlight; if tie, first occurrence
+    longest_idx = max(range(len(words)), key=lambda i: len(words[i]))
+
+    result: list[str] = []
+    for i, word in enumerate(words):
+        if i == longest_idx:
+            # Yellow on, word, reset to style primary colour
+            result.append(f"{{\\c&H0000FFFF&}}{word}{{\\c}}")
+        else:
+            result.append(word)
+    return " ".join(result)
 
 
 def write_ass_subtitles(
@@ -572,8 +601,8 @@ def write_ass_subtitles(
     for start, end, text in phrases:
         # Ensure minimum display time of 0.4 s so fast words are readable
         end = max(end, start + 0.40)
-        # Upper-case for Instagram reel style
-        caption_text = text.upper()
+        # Upper-case for Instagram reel style, then apply yellow highlight
+        caption_text = _highlight_phrase(text.upper())
         lines.append(
             f"Dialogue: 0,{_ass_time(start)},{_ass_time(end)},Caption,,0,0,0,,{caption_text}"
         )

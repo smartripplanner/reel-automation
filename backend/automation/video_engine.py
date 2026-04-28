@@ -68,7 +68,7 @@ _VIDEO_BRATE = "1M"           # target bitrate — keeps output files small
 _MAX_RATE    = "1500k"        # ceiling
 _BUF_SIZE    = "1500k"        # VBV buffer — small = small encoder RAM
 _AUDIO_BRATE = "96k"          # voice-only reels don't need 128k
-_SCENE_LIMIT = 3              # render at most 3 scenes (was 5)
+_SCENE_LIMIT = 5              # render at most 5 scenes (one per script scene)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Style library
@@ -338,11 +338,26 @@ def _run_ffmpeg(
 # Core FFmpeg render
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _escape_ass_path(path: str) -> str:
+    """
+    Escape a file path for safe use inside an FFmpeg filter_complex string.
+
+    FFmpeg filter_complex uses `:` as an option separator, so colons in the
+    path (e.g. Windows drive letters like `C:`) must be escaped as `\\:`.
+    Backslashes are converted to forward slashes first for clarity.
+    """
+    p = str(Path(path).absolute()).replace("\\", "/")
+    # Escape every colon (drive letter + any theoretical mid-path colons)
+    p = p.replace(":", "\\:")
+    return p
+
+
 def _ffmpeg_render_low_mem(
     clip_paths: list[str],
     audio_path: str,
     output_path: str,
     total_duration: float,
+    ass_path: str | None = None,
     log_handler=None,
 ) -> bool:
     """
@@ -363,20 +378,16 @@ def _ffmpeg_render_low_mem(
           • gc.collect() to return Python-managed memory to the OS
         Peak RAM during phase 1: ~80-120 MB (one clip decode + one encode)
 
-    Phase 2 (concat demuxer — no re-decode):
+    Phase 2 (concat demuxer — single pass):
         ffmpeg -f concat -i list.txt -i audio.mp3 ...
         The concat demuxer streams segments from disk one at a time — it does
         NOT load them all into memory simultaneously.
         Each segment is already 720p and <5 MB, so the muxer barely touches RAM.
-        Peak RAM during phase 2: ~60-80 MB
+        If an ASS subtitle file is provided, the overlay is applied during this
+        existing re-encode pass — no extra pass or extra RAM needed.
+        Peak RAM during phase 2: ~80-120 MB (includes subtitle overlay if active)
 
     Total peak: well under 200 MB, leaving 300+ MB headroom on the 512 MB tier.
-
-    Subtitles
-    ─────────
-    The second subtitle-burn pass is disabled. It would re-load the entire
-    intermediate file into memory for a full re-encode — exactly what killed
-    us before. Captions are disabled at the pipeline level instead.
     """
     import gc
 
@@ -469,21 +480,36 @@ def _ffmpeg_render_low_mem(
                 # FFmpeg concat list requires forward slashes even on Windows
                 fh.write(f"file '{seg.replace(chr(92), '/')}'\n")
 
-        # ── Phase 3: concat + audio → final output ───────────────────────────────
+        # ── Phase 3: concat + audio (+ optional subtitle overlay) → final output ──
         # adelay=500|500 : 500 ms hook pause before voice starts
         # atempo=1.25    : 25 % pitch-preserving speed-up (same as before)
         afmt = "aformat=sample_rates=44100:channel_layouts=stereo"
-        audio_filter = (
+        audio_chain = (
             f"[1:a]{afmt},volume=1.0,"
             f"adelay=500|500,atempo=1.25,apad[final_a]"
         )
+
+        # When an ASS file is available, burn subtitles during this existing
+        # re-encode pass (no extra pass = no extra RAM cost).
+        # When absent, pass the video stream through without any video filter.
+        use_subtitles = bool(ass_path and Path(ass_path).exists())
+
+        if use_subtitles:
+            escaped = _escape_ass_path(ass_path)
+            video_chain = f"[0:v]ass=filename='{escaped}'[final_v]"
+            full_filter = f"{video_chain};{audio_chain}"
+            video_map = "[final_v]"
+            _log(log_handler, "[Render] Burning ASS subtitles in Phase 2 pass")
+        else:
+            full_filter = audio_chain
+            video_map = "0:v"
 
         concat_cmd = [
             ffmpeg_bin, "-y",
             "-f", "concat", "-safe", "0", "-i", concat_list_path,
             "-i", audio_abs,
-            "-filter_complex", audio_filter,
-            "-map", "0:v",
+            "-filter_complex", full_filter,
+            "-map", video_map,
             "-map", "[final_a]",
             "-c:v", "libx264",
             "-preset", _PRESET,
@@ -719,7 +745,7 @@ def create_reel_video(
     clip_paths: list[str],
     audio_path: str,
     script_text: str,
-    ass_path: str | None = None,   # kept for API compat — subtitles disabled
+    ass_path: str | None = None,
     log_handler=None,
     hook_text: str | None = None,
 ) -> str:
@@ -730,14 +756,16 @@ def create_reel_video(
     ────────
     1. FFmpeg low-memory path (sequential segments → concat demuxer)
        Peak RAM: ~120-160 MB. Target: sub-400 MB total process.
+       ASS subtitles are burned in during the existing Phase 2 re-encode
+       pass — no extra pass, no extra memory cost.
     2. MoviePy fallback only if FFmpeg is not on PATH.
        (MoviePy loads all clips into Python RAM — avoid on Render free tier)
 
     Resolution : 720×1280  (down from 1080×1920)
     Preset     : ultrafast (down from fast)
     Bitrate    : 1 Mbit/s  (down from 8 Mbit/s)
-    Scenes     : 3 max     (down from 5)
-    Subtitles  : disabled  (eliminates the entire second FFmpeg pass)
+    Scenes     : 5 max     (one per script scene)
+    Subtitles  : burned in via ASS filter (estimation-based, no Whisper)
     """
     import gc
     ensure_storage_dirs()
@@ -759,12 +787,14 @@ def create_reel_video(
         total_duration = (probed / _ATEMPO) + _DELAY_S + _BUFFER_S
 
     if _ffmpeg_available():
-        _log(log_handler, f"[Render] 720p / ultrafast / 1M / {len(working_clips)} scenes")
+        sub_label = "with ASS captions" if ass_path else "no captions"
+        _log(log_handler, f"[Render] 720p / ultrafast / 1M / {len(working_clips)} scenes / {sub_label}")
         success = _ffmpeg_render_low_mem(
             clip_paths=working_clips,
             audio_path=audio_path,
             output_path=output_path,
             total_duration=total_duration,
+            ass_path=ass_path,
             log_handler=log_handler,
         )
         gc.collect()
