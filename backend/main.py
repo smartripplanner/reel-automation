@@ -17,7 +17,7 @@ from fastapi.responses import JSONResponse
 
 from database import init_db
 import models  # noqa: F401 — registers ALL ORM models (incl. Job) with Base.metadata
-from routes import automation, jobs, logs, reels, settings
+from routes import automation, export, jobs, logs, reels, settings
 from schemas import HealthResponse, RootResponse
 
 
@@ -81,6 +81,7 @@ app.add_middleware(
 )
 
 app.include_router(automation.router)
+app.include_router(export.router)
 app.include_router(jobs.router)
 app.include_router(reels.router)
 app.include_router(settings.router)

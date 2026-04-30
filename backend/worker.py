@@ -69,10 +69,9 @@ def main() -> None:
         print(f"[Worker] DB init warning: {exc}", flush=True)
 
     from services import job_service
-    from services.reel_service import create_reel
     from services.settings_service import get_or_create_settings
     from database import SessionLocal
-    from automation.main_pipeline import run_pipeline
+    from automation.main_pipeline import run_script_pipeline
     from utils.memory_guard import log_ram
 
     # Mark job as running in DB (visible to FastAPI server immediately)
@@ -91,33 +90,39 @@ def main() -> None:
             settings = get_or_create_settings(db)
             category = settings.niche
 
-        _log(f"Starting — category={category!r} topic_override={topic!r}")
+        _log(f"Generating script — category={category!r} topic={topic!r}")
 
-        result = run_pipeline(
+        # Script-only pipeline: topic gen + script gen, NO FFmpeg, NO clips.
+        # Heavy rendering (clips + TTS + FFmpeg) runs in local_renderer.py
+        # on the user's machine so Render never handles RAM-intensive work.
+        result = run_script_pipeline(
             topic=topic,
             category_hint=category,
             log_handler=_log,
         )
 
-        file_path = result.get("file_path") or "storage/reels/unavailable.mp4"
-        caption   = result.get("caption")   or "Auto-generated reel"
-        status    = result.get("status",    "completed")
+        status = result.get("status", "script_ready")
+        topic_out = result.get("topic", category or topic or "")
+        scenes = result.get("scenes", [])
 
-        # Persist the reel record in DB
-        reel = create_reel(db=db, file_path=file_path, caption=caption, status=status)
-
-        job_service.set_completed(job_id, {
-            "status":    status,
-            "file_path": file_path,
-            "caption":   caption,
-            "topic":     result.get("topic", ""),
-            "reel_id":   reel.id,
-        })
-        _log(f"Pipeline complete — status={status} file={file_path}")
+        _log(f"Script ready — {len(scenes)} scenes | topic={topic_out!r}")
         log_ram("Worker end", None)
 
+        # Store the full structured result so /export-job/{id} can serve it
+        job_service.set_completed(job_id, {
+            "status":      "script_ready",
+            "topic":       topic_out,
+            "hook":        result.get("hook", ""),
+            "scenes":      scenes,
+            "hashtags":    result.get("hashtags", []),
+            "format_type": result.get("format_type", "voiceover"),
+            "provider":    result.get("provider", "unknown"),
+            "script_path": result.get("script_path", ""),
+            "script":      "\n".join(s.get("display", "") for s in scenes),
+        })
+
     except Exception as exc:
-        _log(f"Pipeline error: {exc}")
+        _log(f"Script generation error: {exc}")
         job_service.set_failed(job_id, str(exc))
         sys.exit(1)
 
