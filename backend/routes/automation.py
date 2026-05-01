@@ -21,7 +21,7 @@ logger = logging.getLogger(__name__)
 
 
 class GenerateRequest(BaseModel):
-    topic: str
+    topic: str = ""   # optional — empty string → worker falls back to Settings niche
 
 
 router = APIRouter(prefix="/automation", tags=["automation"])
@@ -57,11 +57,13 @@ def generate_reel_route(
     blocked by the pipeline and cannot be OOM-killed by FFmpeg rendering.
     Poll GET /jobs/{job_id} for live progress and final status.
     """
-    job_id = job_service.create_job(topic=req.topic)
-    log_message(db, f"Manual reel queued (subprocess) — topic: {req.topic!r} | job_id={job_id}")
-    logger.info(f"[Generate] job_id={job_id} topic={req.topic!r}")
-    pid = spawn_worker(job_id, topic=req.topic)
-    return {"job_id": job_id, "status": "queued", "topic": req.topic, "worker_pid": pid}
+    clean_topic = req.topic.strip()
+    job_id = job_service.create_job(topic=clean_topic)
+    log_message(db, f"Reel queued — topic: {clean_topic!r or '(auto)'} | job_id={job_id}")
+    logger.info(f"[Generate] job_id={job_id} topic={clean_topic!r}")
+    # Pass topic only when non-empty; worker falls back to settings.niche otherwise
+    pid = spawn_worker(job_id, topic=clean_topic)
+    return {"job_id": job_id, "status": "queued", "topic": clean_topic, "worker_pid": pid}
 
 
 @router.post("/generate-batch", response_model=BatchGenerateResponse)

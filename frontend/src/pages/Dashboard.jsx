@@ -2,7 +2,19 @@ import ControlPanel from "../components/ControlPanel";
 import ReelList from "../components/ReelList";
 import StatusCard from "../components/StatusCard";
 
-const Dashboard = ({ status, reels, logs, onStart, onStop, onGenerate, onGenerateBatch, busy, batchProgress }) => {
+const Dashboard = ({
+  status,
+  reels,
+  logs,
+  onStart,
+  onStop,
+  onGenerate,
+  onGenerateBatch,
+  busy,
+  batchProgress,
+  topic,
+  onTopicChange,
+}) => {
   const reelsToday = reels.filter((reel) => {
     const createdAt = new Date(reel.created_at);
     const now = new Date();
@@ -38,6 +50,8 @@ const Dashboard = ({ status, reels, logs, onStart, onStop, onGenerate, onGenerat
         onGenerateBatch={onGenerateBatch}
         busy={busy}
         batchProgress={batchProgress}
+        topic={topic}
+        onTopicChange={onTopicChange}
       />
 
       <section className="grid gap-6 xl:grid-cols-[1.4fr_1fr]">
@@ -45,15 +59,15 @@ const Dashboard = ({ status, reels, logs, onStart, onStop, onGenerate, onGenerat
 
         <div className="rounded-[2rem] border border-slate-200 bg-white/80 p-6 shadow-panel backdrop-blur">
           <h3 className="text-xl font-bold text-ink">Activity Logs</h3>
-          <p className="text-sm text-slate-500">Pipeline and system events from the local database.</p>
+          <p className="text-sm text-slate-500">Pipeline and system events.</p>
 
-          <div className="mt-5 space-y-3">
+          <div className="mt-5 space-y-3 max-h-[420px] overflow-y-auto pr-1">
             {logs.length === 0 ? (
               <div className="rounded-2xl border border-dashed border-slate-300 p-5 text-sm text-slate-500">
                 No logs recorded yet.
               </div>
             ) : (
-              logs.map((log) => (
+              logs.slice().reverse().map((log) => (
                 <div key={log.id} className="rounded-2xl border border-slate-200 bg-slate-50 p-4">
                   <p className="text-sm font-medium text-ink">{log.message}</p>
                   <p className="mt-1 text-xs uppercase tracking-[0.14em] text-slate-400">

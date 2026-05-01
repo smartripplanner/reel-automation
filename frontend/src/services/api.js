@@ -1,7 +1,7 @@
 import axios from "axios";
 
 // Vite exposes env vars via import.meta.env (not process.env).
-// Set VITE_API_URL in frontend/.env (local) or the hosting dashboard (prod).
+// Set VITE_API_URL in frontend/.env or leave blank to use localhost:8000.
 const API_BASE = import.meta.env.VITE_API_URL || "http://127.0.0.1:8000";
 
 const api = axios.create({
@@ -24,10 +24,14 @@ export const stopAutomation = async () => {
   return data;
 };
 
-// Trigger a single reel with an explicit topic.
-// Returns { job_id, status, topic } — pipeline runs in background.
-export const generateReel = async (topic = "Travel Tips & Hidden Gems") => {
-  const { data } = await api.post("/automation/generate", { topic });
+/**
+ * Trigger a single reel with an optional explicit topic.
+ * If topic is empty/undefined the backend uses the saved niche from Settings.
+ * Returns { job_id, status, topic }
+ */
+export const generateReel = async (topic) => {
+  const payload = { topic: topic?.trim() || "" };
+  const { data } = await api.post("/automation/generate", payload);
   return data;
 };
 
@@ -61,3 +65,15 @@ export const getJobStatus = async (jobId) => {
   const { data } = await api.get(`/jobs/${jobId}`);
   return data; // { id, status, logs, result }
 };
+
+/**
+ * Returns the URL for in-browser <video> streaming of a completed reel.
+ * Use this as the `src` of a <video> element.
+ */
+export const getVideoUrl = (jobId) => `${API_BASE}/jobs/${jobId}/video`;
+
+/**
+ * Returns the download URL for a completed reel.
+ * Use this as the `href` of an <a download> element.
+ */
+export const getDownloadUrl = (jobId) => `${API_BASE}/jobs/${jobId}/download`;

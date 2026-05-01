@@ -49,16 +49,16 @@ class WordStamp:
 @dataclass
 class CaptionStyle:
     font_name: str = "Arial Black"
-    font_size: int = 47              # 720p (720×1280) — scaled from 1080p value (70 × 720/1080 ≈ 47)
+    font_size: int = 52              # Local production size — large, readable, bold
     primary_colour: str = "&H00FFFFFF"   # white  (ASS = &HAABBGGRR)
-    outline_colour: str = "&H00000000"   # black
-    back_colour: str = "&H00000000"      # unused with BorderStyle=1
+    outline_colour: str = "&H00000000"   # black outline
+    back_colour: str = "&H00000000"
     bold: bool = True
-    outline_size: int = 3            # 720p outline — scaled from 1080p value (4 × 0.667 ≈ 3)
-    shadow_depth: int = 1            # 720p shadow — scaled from 1080p value (2 × 0.667 ≈ 1)
-    alignment: int = 5               # centre-screen for high-impact reel captions
-    margin_v: int = 100              # 720p lower-third safe zone — scaled from 1080p value (150 × 0.667 ≈ 100)
-    margin_lr: int = 40              # 720p left/right safe-zone margin — scaled from 1080p value (60 × 0.667 ≈ 40)
+    outline_size: int = 2            # clean 2px outline — crisp without looking clunky
+    shadow_depth: int = 1
+    alignment: int = 2               # bottom-center (ASS numpad layout: 2=bottom-center)
+    margin_v: int = 120              # distance from bottom edge — safe zone
+    margin_lr: int = 40              # left/right safe margins
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -75,8 +75,8 @@ class CaptionStyle:
 #
 # Combined correction: corrected = (original / voice_speed) + voice_delay_s
 
-_AUDIO_SPEED   = 1.25   # must equal _VOICE_SPEED in video_engine.py
-_AUDIO_DELAY_S = 0.50   # must equal adelay ms / 1000 in video_engine.py  (500 ms)
+_AUDIO_SPEED   = 1.0    # local mode: no speed-up (natural pace)
+_AUDIO_DELAY_S = 0.50   # adelay=500ms in video_engine.py — hook pause before voice
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -603,8 +603,9 @@ def write_ass_subtitles(
         end = max(end, start + 0.40)
         # Upper-case for Instagram reel style, then apply yellow highlight
         caption_text = _highlight_phrase(text.upper())
+        # {\fad(150,150)} — 150ms fade-in + 150ms fade-out for smooth transitions
         lines.append(
-            f"Dialogue: 0,{_ass_time(start)},{_ass_time(end)},Caption,,0,0,0,,{caption_text}"
+            f"Dialogue: 0,{_ass_time(start)},{_ass_time(end)},Caption,,0,0,0,,{{\\fad(150,150)}}{caption_text}"
         )
 
     out = Path(output_path)

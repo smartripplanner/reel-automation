@@ -1,31 +1,36 @@
 """
-Video Engine — FFmpeg-direct rendering replacing MoviePy frame loops.
+Video Engine — Full-quality local FFmpeg renderer.
 
-Why FFmpeg direct over MoviePy
-───────────────────────────────
-MoviePy works by:
-  1. Decoding every source frame into a NumPy array in Python
-  2. Applying effects frame-by-frame in pure Python
-  3. Re-encoding via FFmpeg
+This runs ENTIRELY on the user's local machine with no memory constraints.
+No FREE_PLAN mode. No quality downgrades. No memory guards.
 
-On a 20-second reel at 30 fps that's 600 Python iterations just for one clip.
-With 4 clips + a hook screen the Python loop overhead alone takes 4-8 minutes.
+Quality targets
+───────────────
+  Resolution : 720 × 1280 (portrait 9:16)   — upgrade to 1080p via env var
+  FPS        : 30
+  CRF        : 22  (visually near-lossless for web)
+  Preset     : medium  (excellent quality / speed balance)
+  Video rate : 2 Mbps target, 3 Mbps max
+  Audio      : AAC 128 k, 44.1 kHz stereo
+  Pixel fmt  : yuv420p  (maximum compatibility)
+  Flags      : +faststart (instant web playback)
 
-FFmpeg direct:
-  1. Builds a filtergraph string describing ALL operations
-  2. Calls FFmpeg ONCE as a subprocess — C-native multi-threaded processing
-  3. Hook screen rendered with PIL → PNG → piped to FFmpeg (no MoviePy needed)
-  4. ASS subtitles burned in natively by FFmpeg's `ass` filter
-  5. End-to-end render time: 25-90 seconds on a modern CPU
+Render strategy
+───────────────
+Phase 1 — per-clip encode:
+  Each source clip is individually transcoded to the target resolution,
+  cropped to fill the 9:16 frame, and written as a small segment file.
+  Source clips are deleted after encoding to free disk space.
 
-Fallback
-────────
-If FFmpeg is not on PATH or the filtergraph fails, the engine falls back to
-the original MoviePy path so the pipeline never hard-crashes.
+Phase 2 — concat + audio + ASS burn:
+  FFmpeg's concat demuxer joins all segments (stream-reads from disk — no
+  simultaneous decode) while simultaneously mixing the TTS voice track,
+  burning in ASS subtitles, and writing the final MP4 in a single pass.
 """
 
 from __future__ import annotations
 
+import gc
 import os
 import random
 import re
@@ -44,53 +49,36 @@ from utils.storage import BASE_DIR, MUSIC_DIR, REELS_DIR, ensure_storage_dirs, t
 ensure_pillow_compat()
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Plan-aware constants
+# Quality constants — LOCAL production mode, no limits
 # ─────────────────────────────────────────────────────────────────────────────
-#
-# Set FREE_PLAN=true in Render environment to enable the 480×854 / veryfast
-# / 700k mode.  Unset (or false) → 720×1280 / ultrafast / 1M (default).
-#
-# FREE_PLAN differences:
-#   Resolution  : 480×854   vs 720×1280  (56% fewer pixels → smaller decode buffers)
-#   Preset      : veryfast  vs ultrafast (veryfast compresses better at same speed)
-#   Bitrate     : 700k      vs 1M        (smaller output file, less write I/O)
-#   Max-rate    : 900k      vs 1500k
-#   Buffer      : 900k      vs 1500k
-#
-# NOTE: ultrafast uses LESS CPU but MORE bitrate to hit the same quality.
-#       veryfast uses slightly more CPU but produces a smaller file.
-#       On Render free plan the bottleneck is RAM, not CPU, so veryfast is
-#       the better choice for staying under 512 MB.
 
-_FREE_PLAN = os.getenv("FREE_PLAN", "false").lower() in ("true", "1", "yes")
+# Allow 1080p via env: LOCAL_RENDER_1080=true
+_WANT_1080 = os.getenv("LOCAL_RENDER_1080", "false").lower() in ("true", "1", "yes")
 
-if _FREE_PLAN:
-    FRAME_W, FRAME_H = 480, 854
-    _PRESET      = "veryfast"
-    _CRF         = "30"
-    _VIDEO_BRATE = "700k"
-    _MAX_RATE    = "900k"
-    _BUF_SIZE    = "900k"
-    _AUDIO_BRATE = "96k"
+if _WANT_1080:
+    FRAME_W, FRAME_H = 1080, 1920
+    _VIDEO_BRATE = "4M"
+    _MAX_RATE    = "6M"
+    _BUF_SIZE    = "6M"
 else:
     FRAME_W, FRAME_H = 720, 1280
-    _PRESET      = "ultrafast"
-    _CRF         = "28"
-    _VIDEO_BRATE = "1M"
-    _MAX_RATE    = "1500k"
-    _BUF_SIZE    = "1500k"
-    _AUDIO_BRATE = "96k"
+    _VIDEO_BRATE = "2M"
+    _MAX_RATE    = "3M"
+    _BUF_SIZE    = "3M"
 
-FPS = 24                      # 24fps — 20% fewer frames than 30fps
+_PRESET      = "medium"     # best quality/speed trade-off for local rendering
+_CRF         = "22"         # near-lossless visible quality
+_AUDIO_BRATE = "128k"
+FPS          = 30           # smooth 30fps for professional reels
 HOOK_DURATION = 2.0
 SAFE_X = int(FRAME_W * 0.07)
 SAFE_Y = int(FRAME_H * 0.10)
 MUSIC_VOLUME = 0.08
 TEMP_RENDER_ROOT = BASE_DIR / "storage" / "tmp"
-_SCENE_LIMIT = 5              # render at most 5 scenes (one per script scene)
+_SCENE_LIMIT = 7            # support up to 7 scenes
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Style library
+# Hook screen styles
 # ─────────────────────────────────────────────────────────────────────────────
 
 STYLES = [
@@ -153,13 +141,17 @@ def _log(handler, msg: str) -> None:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _load_font(size: int) -> ImageFont.FreeTypeFont:
-    for path in [
+    candidates = [
         "C:/Windows/Fonts/arialbd.ttf",
+        "C:/Windows/Fonts/ariblk.ttf",       # Arial Black
         "C:/Windows/Fonts/segoeuib.ttf",
         "C:/Windows/Fonts/verdanab.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",   # Linux
+        "/System/Library/Fonts/Supplemental/Arial Bold.ttf",       # macOS
         "arialbd.ttf",
         "arial.ttf",
-    ]:
+    ]
+    for path in candidates:
         try:
             return ImageFont.truetype(path, size)
         except OSError:
@@ -168,11 +160,10 @@ def _load_font(size: int) -> ImageFont.FreeTypeFont:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Hook screen — rendered to PNG with PIL, fed to FFmpeg as input
+# Hook screen — PNG rendered with PIL, fed to FFmpeg
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _wrap_text(text: str, font: ImageFont.FreeTypeFont, max_width: int) -> list[str]:
-    """Word-wrap text to fit within max_width pixels."""
     words = text.split()
     lines: list[str] = []
     current = ""
@@ -193,22 +184,18 @@ def _wrap_text(text: str, font: ImageFont.FreeTypeFont, max_width: int) -> list[
 
 
 def render_hook_frame(hook_text: str, style: dict, output_path: str) -> str:
-    """
-    Render a 1080×1920 PNG for the hook screen.
-    Returns output_path on success.
-    """
-    img = Image.new("RGB", (FRAME_W, FRAME_H), color=tuple(c - 20 for c in style["bg"]) if any(c > 20 for c in style["bg"]) else style["bg"])
+    """Render a portrait PNG hook screen. Returns output_path."""
+    bg = tuple(c - 20 for c in style["bg"]) if any(c > 20 for c in style["bg"]) else style["bg"]
+    img = Image.new("RGB", (FRAME_W, FRAME_H), color=bg)
     draw = ImageDraw.Draw(img, "RGBA")
 
     max_text_w = int(FRAME_W * 0.84)
     clean_text = hook_text.replace("HOOK:", "").strip().upper()
 
-    # Fit font size
     font_size = style["hook_font_size"]
     font = _load_font(font_size)
     lines = _wrap_text(clean_text, font, max_text_w)
 
-    # Shrink until it fits within 3 lines
     while len(lines) > 3 and font_size > 40:
         font_size -= 6
         font = _load_font(font_size)
@@ -220,20 +207,17 @@ def render_hook_frame(hook_text: str, style: dict, output_path: str) -> str:
     bx = (FRAME_W - block_w) / 2
     by = (FRAME_H - block_h) / 2
 
-    # Panel with rounded corners
     panel_color = (*style["bg"], style["panel_alpha"])
     draw.rounded_rectangle((bx, by, bx + block_w, by + block_h), radius=28, fill=panel_color)
 
-    # Text
     cy = by + 30
     for line in lines:
         bbox = draw.textbbox((0, 0), line, font=font, stroke_width=3)
         lw = bbox[2] - bbox[0]
         cx = (FRAME_W - lw) / 2
-        # Shadow
         draw.text((cx + 3, cy + 3), line, font=font, fill=(0, 0, 0, 140))
-        # Stroke
-        draw.text((cx, cy), line, font=font, fill=style["text"], stroke_width=3, stroke_fill=(0, 0, 0, 255))
+        draw.text((cx, cy), line, font=font, fill=style["text"], stroke_width=3,
+                  stroke_fill=(0, 0, 0, 255))
         cy += line_h
 
     img.save(output_path, "PNG")
@@ -255,39 +239,25 @@ def _pick_music() -> str | None:
 # FFmpeg binary resolution
 # ─────────────────────────────────────────────────────────────────────────────
 
-# Known install locations tried in order when ffmpeg is not on PATH.
-# Covers: winget, chocolatey, scoop, manual extraction.
 _FFMPEG_FALLBACK_PATHS = [
-    # winget (Gyan full build — most common on Windows 11)
     r"C:\Users\{user}\AppData\Local\Microsoft\WinGet\Packages\Gyan.FFmpeg_Microsoft.Winget.Source_8wekyb3d8bbwe\ffmpeg-8.1-full_build\bin\ffmpeg.exe",
     r"C:\Users\{user}\AppData\Local\Microsoft\WinGet\Packages\Gyan.FFmpeg_Microsoft.Winget.Source_8wekyb3d8bbwe\ffmpeg-8.0-full_build\bin\ffmpeg.exe",
-    # chocolatey
     r"C:\ProgramData\chocolatey\bin\ffmpeg.exe",
-    # scoop
     r"C:\Users\{user}\scoop\apps\ffmpeg\current\bin\ffmpeg.exe",
-    # manual common locations
     r"C:\ffmpeg\bin\ffmpeg.exe",
     r"C:\Program Files\ffmpeg\bin\ffmpeg.exe",
 ]
 
 
 def _resolve_ffmpeg() -> str | None:
-    """
-    Return the absolute path to the ffmpeg executable, or None if not found.
-
-    Checks PATH first, then a list of well-known install locations.
-    """
     on_path = shutil.which("ffmpeg")
     if on_path:
         return on_path
-
-    import os as _os
-    username = _os.environ.get("USERNAME", _os.environ.get("USER", ""))
+    username = os.environ.get("USERNAME", os.environ.get("USER", ""))
     for template in _FFMPEG_FALLBACK_PATHS:
         candidate = template.replace("{user}", username)
         if Path(candidate).exists():
             return candidate
-
     return None
 
 
@@ -300,22 +270,13 @@ def _get_media_duration(path: str) -> float:
     ffprobe_bin = str(Path(ffmpeg_bin).with_name("ffprobe.exe" if os.name == "nt" else "ffprobe"))
     target = os.path.abspath(path)
     probe_cmd = [
-        ffprobe_bin,
-        "-v",
-        "error",
-        "-show_entries",
-        "format=duration",
-        "-of",
-        "default=noprint_wrappers=1:nokey=1",
+        ffprobe_bin, "-v", "error",
+        "-show_entries", "format=duration",
+        "-of", "default=noprint_wrappers=1:nokey=1",
         target,
     ]
     try:
-        result = subprocess.run(
-            probe_cmd,
-            capture_output=True,
-            text=True,
-            timeout=15,
-        )
+        result = subprocess.run(probe_cmd, capture_output=True, text=True, timeout=15)
         if result.returncode == 0 and result.stdout.strip():
             return float(result.stdout.strip())
     except Exception:
@@ -327,24 +288,18 @@ def _run_ffmpeg(
     cmd: list[str],
     log_handler=None,
     cwd: str | None = None,
-    timeout: int = 900,       # 15 min — 4K UHD clips need the headroom
+    timeout: int = 1800,
     label: str = "FFmpeg",
 ) -> tuple[bool, str]:
     try:
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            cwd=cwd,
-        )
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, cwd=cwd)
         stderr = (result.stderr or "").strip()
         if result.returncode != 0:
             _log(log_handler, f"{label} failed (rc={result.returncode}): {stderr[-3000:]}")
             return False, stderr
         return True, stderr
     except subprocess.TimeoutExpired:
-        msg = f"{label} timed out after {timeout} seconds"
+        msg = f"{label} timed out after {timeout}s"
         _log(log_handler, msg)
         return False, msg
     except Exception as exc:
@@ -354,73 +309,55 @@ def _run_ffmpeg(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Core FFmpeg render
+# Path escaping for FFmpeg filter_complex
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _escape_ass_path(path: str) -> str:
-    """
-    Escape a file path for safe use inside an FFmpeg filter_complex string.
-
-    FFmpeg filter_complex uses `:` as an option separator, so colons in the
-    path (e.g. Windows drive letters like `C:`) must be escaped as `\\:`.
-    Backslashes are converted to forward slashes first for clarity.
-    """
+    """Escape a path for safe use inside FFmpeg filter_complex (colons, backslashes)."""
     p = str(Path(path).absolute()).replace("\\", "/")
-    # Escape every colon (drive letter + any theoretical mid-path colons)
     p = p.replace(":", "\\:")
     return p
 
 
-def _ffmpeg_render_low_mem(
+# ─────────────────────────────────────────────────────────────────────────────
+# Phase 1 — per-clip segment encoding
+# Phase 2 — concat + audio + ASS burn → final MP4
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _ffmpeg_render(
     clip_paths: list[str],
     audio_path: str,
     output_path: str,
     total_duration: float,
     ass_path: str | None = None,
-    srt_path: str | None = None,
     log_handler=None,
 ) -> bool:
     """
-    Memory-safe FFmpeg render for Render free tier (512 MB RAM hard limit).
+    Two-phase FFmpeg render.
 
-    Why the old approach OOMed
-    ──────────────────────────
-    The previous filtergraph loaded ALL clips as simultaneous FFmpeg inputs.
-    Five 4K clips (50-80 MB each) decoded simultaneously = 400-600 MB just
-    for the video streams, before encoding buffers or Python overhead.
+    Phase 1: Encode each clip individually → small uniform 720×1280 segment.
+             Source clip deleted after encode (frees disk space immediately).
 
-    New approach — two logical phases
-    ──────────────────────────────────
-    Phase 1 (sequential, one clip at a time):
-        For each source clip:
-          • Transcode to 720×1280, ultrafast, 1 M bitrate → small segment file
-          • Delete the source clip immediately after (frees ~50 MB per clip)
-          • gc.collect() to return Python-managed memory to the OS
-        Peak RAM during phase 1: ~80-120 MB (one clip decode + one encode)
-
-    Phase 2 (concat demuxer — single pass):
-        ffmpeg -f concat -i list.txt -i audio.mp3 ...
-        The concat demuxer streams segments from disk one at a time — it does
-        NOT load them all into memory simultaneously.
-        Each segment is already 720p and <5 MB, so the muxer barely touches RAM.
-        If an ASS subtitle file is provided, the overlay is applied during this
-        existing re-encode pass — no extra pass or extra RAM needed.
-        Peak RAM during phase 2: ~80-120 MB (includes subtitle overlay if active)
-
-    Total peak: well under 200 MB, leaving 300+ MB headroom on the 512 MB tier.
+    Phase 2: concat demuxer joins segments → mix TTS audio → burn ASS → MP4.
+             Single-pass re-encode with full quality settings.
     """
-    import gc
-
     if not clip_paths:
+        _log(log_handler, "[Render] No clips provided")
         return False
 
-    # Cap scenes to limit — caller should already do this, but guard here too
     working_clips = clip_paths[:_SCENE_LIMIT]
     num_scenes = len(working_clips)
     scene_duration = max(total_duration / num_scenes, 2.0)
 
     ffmpeg_bin = _resolve_ffmpeg() or "ffmpeg"
-    audio_abs  = os.path.abspath(str(BASE_DIR / Path(audio_path)))
+
+    # Resolve audio path — may be absolute or relative to BASE_DIR
+    audio_abs_candidate = Path(audio_path)
+    if audio_abs_candidate.is_absolute() and audio_abs_candidate.exists():
+        audio_abs = str(audio_abs_candidate)
+    else:
+        audio_abs = str(BASE_DIR / Path(audio_path))
+
     output_abs = os.path.abspath(output_path)
 
     TEMP_RENDER_ROOT.mkdir(parents=True, exist_ok=True)
@@ -430,9 +367,15 @@ def _ffmpeg_render_low_mem(
     concat_list_path = str(TEMP_RENDER_ROOT / f"concat_{job_tag}.txt")
 
     try:
-        # ── Phase 1: encode each clip into a small uniform segment ──────────────
+        # ── Phase 1: encode each clip → segment ────────────────────────────────
         for idx, cp in enumerate(working_clips):
-            abs_cp = os.path.abspath(str(BASE_DIR / Path(cp)))
+            # Resolve clip path
+            abs_cp_candidate = Path(cp)
+            if abs_cp_candidate.is_absolute() and abs_cp_candidate.exists():
+                abs_cp = str(abs_cp_candidate)
+            else:
+                abs_cp = str(BASE_DIR / Path(cp))
+
             if not Path(abs_cp).exists():
                 _log(log_handler, f"[Render] Clip {idx+1} missing — skipping")
                 continue
@@ -446,9 +389,7 @@ def _ffmpeg_render_low_mem(
             seg_cmd = [
                 ffmpeg_bin, "-y",
                 "-i", abs_cp,
-                # Scale → crop → normalise → trim — all in a single decode pass
-                "-vf",
-                (
+                "-vf", (
                     f"scale={FRAME_W}:{FRAME_H}:force_original_aspect_ratio=increase,"
                     f"crop={FRAME_W}:{FRAME_H},"
                     f"setsar=1,"
@@ -458,79 +399,66 @@ def _ffmpeg_render_low_mem(
                 ),
                 "-c:v", "libx264",
                 "-preset", _PRESET,
-                "-crf",    _CRF,
-                "-b:v",    _VIDEO_BRATE,
+                "-crf", _CRF,
+                "-b:v", _VIDEO_BRATE,
                 "-maxrate", _MAX_RATE,
                 "-bufsize", _BUF_SIZE,
                 "-pix_fmt", "yuv420p",
-                "-colorspace",      "bt709",
+                "-colorspace", "bt709",
                 "-color_primaries", "bt709",
-                "-color_trc",       "bt709",
-                "-an",              # no audio — added in phase 2
+                "-color_trc", "bt709",
+                "-an",                      # no audio in segments
                 "-r", str(FPS),
                 "-t", str(target_dur),
                 seg_path,
             ]
 
-            _log(log_handler, f"[Render] Segment {idx+1}/{num_scenes}...")
-            ok, _err = _run_ffmpeg(
-                seg_cmd, log_handler=log_handler,
-                label=f"Seg {idx+1}", timeout=180,
-            )
+            _log(log_handler, f"[Render] Encoding segment {idx+1}/{num_scenes} ({target_dur:.1f}s)...")
+            ok, _ = _run_ffmpeg(seg_cmd, log_handler=log_handler,
+                                label=f"Seg {idx+1}", timeout=300)
             if ok and Path(seg_path).exists():
                 segment_paths.append(seg_path)
             else:
                 _log(log_handler, f"[Render] Segment {idx+1} failed — skipping clip")
 
-            # Delete source immediately — frees 5-80 MB per clip
+            # Free disk space immediately
             try:
                 Path(abs_cp).unlink(missing_ok=True)
             except Exception:
                 pass
 
-            gc.collect()   # return freed memory to OS before next clip
-
         if not segment_paths:
             _log(log_handler, "[Render] No segments produced — aborting")
             return False
 
-        # ── Phase 2: write concat list ───────────────────────────────────────────
+        # ── Phase 2: write concat list ─────────────────────────────────────────
         with open(concat_list_path, "w") as fh:
             for seg in segment_paths:
-                # FFmpeg concat list requires forward slashes even on Windows
                 fh.write(f"file '{seg.replace(chr(92), '/')}'\n")
 
-        # ── Phase 3: concat + audio (+ optional subtitle overlay) → final output ──
-        # adelay=500|500 : 500 ms hook pause before voice starts
-        # atempo=1.25    : 25 % pitch-preserving speed-up (same as before)
+        # ── Phase 2: audio chain ───────────────────────────────────────────────
+        # atempo=1.0 — no speed-up in local mode (full natural pace)
+        # adelay=500ms — half-second hook pause before voice starts
         afmt = "aformat=sample_rates=44100:channel_layouts=stereo"
         audio_chain = (
             f"[1:a]{afmt},volume=1.0,"
-            f"adelay=500|500,atempo=1.25,apad[final_a]"
+            f"adelay=500|500,"
+            f"apad[final_a]"
         )
 
-        # Subtitle burn-in during this existing re-encode pass (no extra pass).
-        # Priority: ASS (paid plan, yellow highlights) > SRT (free plan) > none.
-        # Both use FFmpeg's `subtitles=` filter with libass — the difference is
-        # only in the file format and styling complexity.
+        # ── Phase 2: subtitle burn-in ──────────────────────────────────────────
         use_ass = bool(ass_path and Path(ass_path).exists())
-        use_srt = bool(not use_ass and srt_path and Path(srt_path).exists())
 
         if use_ass:
             escaped = _escape_ass_path(ass_path)
             video_chain = f"[0:v]ass=filename='{escaped}'[final_v]"
             full_filter = f"{video_chain};{audio_chain}"
             video_map = "[final_v]"
-            _log(log_handler, "[Render] Burning ASS subtitles (paid mode)")
-        elif use_srt:
-            escaped = _escape_ass_path(srt_path)   # same escaping rules apply
-            video_chain = f"[0:v]subtitles=filename='{escaped}'[final_v]"
-            full_filter = f"{video_chain};{audio_chain}"
-            video_map = "[final_v]"
-            _log(log_handler, "[Render] Burning SRT subtitles (free plan mode)")
+            _log(log_handler, "[Render] Burning ASS subtitles...")
         else:
             full_filter = audio_chain
             video_map = "0:v"
+            _log(log_handler, "[Render] No subtitles — rendering video only")
 
         concat_cmd = [
             ffmpeg_bin, "-y",
@@ -542,35 +470,31 @@ def _ffmpeg_render_low_mem(
             "-c:v", "libx264",
             "-preset", _PRESET,
             "-profile:v", "high",
-            "-level:v",   "4.0",
-            "-crf",        _CRF,
-            "-b:v",        _VIDEO_BRATE,
-            "-maxrate",    _MAX_RATE,
-            "-bufsize",    _BUF_SIZE,
+            "-level:v", "4.1",
+            "-crf", _CRF,
+            "-b:v", _VIDEO_BRATE,
+            "-maxrate", _MAX_RATE,
+            "-bufsize", _BUF_SIZE,
             "-c:a", "aac",
             "-b:a", _AUDIO_BRATE,
             "-ar", "44100",
             "-ac", "2",
             "-pix_fmt", "yuv420p",
-            "-colorspace",      "bt709",
+            "-colorspace", "bt709",
             "-color_primaries", "bt709",
-            "-color_trc",       "bt709",
+            "-color_trc", "bt709",
             "-movflags", "+faststart",
             "-shortest",
-            "-t", str(total_duration),
             output_abs,
         ]
 
-        _log(log_handler, "[Render] Concat + audio mix → final output...")
-        ok, _err = _run_ffmpeg(
-            concat_cmd, log_handler=log_handler,
-            label="FFmpeg concat", timeout=300,
-        )
-        gc.collect()
+        _log(log_handler, "[Render] Concatenating + mixing audio → final MP4...")
+        ok, _ = _run_ffmpeg(concat_cmd, log_handler=log_handler,
+                            label="FFmpeg concat", timeout=600)
         return ok
 
     finally:
-        # Always clean up segment files and concat list — never leave temp files
+        # Always clean up temp files
         for seg in segment_paths:
             try:
                 Path(seg).unlink(missing_ok=True)
@@ -580,11 +504,10 @@ def _ffmpeg_render_low_mem(
             Path(concat_list_path).unlink(missing_ok=True)
         except Exception:
             pass
-        gc.collect()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# MoviePy fallback — used when FFmpeg is not on PATH or the render fails
+# MoviePy fallback — only when FFmpeg is completely unavailable
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _moviepy_fallback(
@@ -596,150 +519,49 @@ def _moviepy_fallback(
     style: dict,
     log_handler=None,
 ) -> bool:
-    """Scene-based MoviePy fallback — no hook screen, no static title overlays."""
-    _log(log_handler, "Falling back to MoviePy renderer")
+    _log(log_handler, "[Render] Falling back to MoviePy renderer")
     try:
         from moviepy.editor import (
             AudioFileClip, ColorClip, CompositeAudioClip, CompositeVideoClip,
             ImageClip, VideoFileClip, afx, concatenate_videoclips,
         )
-        clips_open: list = []
-        overlay_assets: list[Path] = []
 
-        def _ass_time_to_seconds(value: str) -> float:
-            hours, minutes, seconds = value.split(":")
-            return int(hours) * 3600 + int(minutes) * 60 + float(seconds)
-
-        def _load_caption_events() -> list[tuple[float, float, str]]:
-            if not ass_path or not Path(ass_path).exists():
-                return []
-            events: list[tuple[float, float, str]] = []
-            raw_ass = Path(ass_path).read_text(encoding="utf-8", errors="ignore")
-            for raw_line in raw_ass.splitlines():
-                if not raw_line.startswith("Dialogue:"):
-                    continue
-                parts = raw_line.split(",", 9)
-                if len(parts) < 10:
-                    continue
-                start = _ass_time_to_seconds(parts[1].strip())
-                end = _ass_time_to_seconds(parts[2].strip())
-                text = re.sub(r"\{.*?\}", "", parts[9]).replace("\\N", "\n").strip()
-                if text and end > start:
-                    events.append((start, end, text))
-            return events
-
-        def _render_caption_card(text: str, idx: int) -> str:
-            from textwrap import wrap
-            caption_img = Image.new("RGBA", (FRAME_W, FRAME_H), (0, 0, 0, 0))
-            draw = ImageDraw.Draw(caption_img, "RGBA")
-            font = _load_font(82)
-            lines = wrap(text.strip().upper(), width=18)[:3] or [text.strip().upper()]
-            line_gap = 18
-            padding_x = 44
-            padding_y = 28
-
-            text_boxes = [draw.textbbox((0, 0), line, font=font, stroke_width=4) for line in lines]
-            line_heights = [box[3] - box[1] for box in text_boxes]
-            text_width = max((box[2] - box[0]) for box in text_boxes)
-            text_height = sum(line_heights) + line_gap * max(len(lines) - 1, 0)
-
-            panel_w = min(text_width + padding_x * 2, FRAME_W - SAFE_X * 2)
-            panel_h = text_height + padding_y * 2
-            x1 = int((FRAME_W - panel_w) / 2)
-            y1 = int((FRAME_H - panel_h) / 2)
-            x2 = int(x1 + panel_w)
-            y2 = int(y1 + panel_h)
-
-            draw.rounded_rectangle((x1, y1, x2, y2), radius=30, fill=(0, 0, 0, 170))
-
-            cursor_y = y1 + padding_y
-            for line, box, line_h in zip(lines, text_boxes, line_heights):
-                line_w = box[2] - box[0]
-                cursor_x = int((FRAME_W - line_w) / 2)
-                draw.text(
-                    (cursor_x, cursor_y),
-                    line,
-                    font=font,
-                    fill=tuple(style["text"]) + (255,),
-                    stroke_width=4,
-                    stroke_fill=(0, 0, 0, 255),
-                )
-                cursor_y += line_h + line_gap
-
-            tmp_path = Path(tempfile.gettempdir()) / f"reel_caption_{datetime.utcnow().strftime('%Y%m%d_%H%M%S_%f')}_{idx}.png"
-            caption_img.save(tmp_path, "PNG")
-            overlay_assets.append(tmp_path)
-            return str(tmp_path)
-
-        # Scene clips — one per scene, equal duration, no hook
         audio_abs = str(BASE_DIR / Path(audio_path))
         try:
             vc = AudioFileClip(audio_abs)
             audio_dur = vc.duration
         except Exception:
             vc = None
-            audio_dur = 15.0
+            audio_dur = 20.0
 
         num_scenes = max(len(clip_paths), 1)
         scene_dur = max(audio_dur / num_scenes, 2.0)
 
         seg_clips = []
-        for i, cp in enumerate(clip_paths):
-            dur = scene_dur
-            if cp and (BASE_DIR / Path(cp)).exists():
-                try:
-                    src = VideoFileClip(str(BASE_DIR / Path(cp)))
-                    clips_open.append(src)
-                    if src.duration < dur:
-                        c = src.loop(duration=dur)
-                    else:
-                        c = src.subclip(0, dur)
-                    c = c.resize(height=FRAME_H)
-                    if c.w < FRAME_W:
-                        c = c.resize(width=FRAME_W)
-                    c = c.crop(x_center=c.w / 2, y_center=c.h / 2, width=FRAME_W, height=FRAME_H)
-                    seg_clips.append(c.set_duration(dur))
-                except Exception:
-                    seg_clips.append(ColorClip(size=(FRAME_W, FRAME_H), color=style["bg"], duration=dur))
-            else:
-                seg_clips.append(ColorClip(size=(FRAME_W, FRAME_H), color=style["bg"], duration=dur))
+        clips_open = []
+        for cp in clip_paths:
+            try:
+                abs_cp = str(BASE_DIR / Path(cp)) if not Path(cp).is_absolute() else cp
+                src = VideoFileClip(abs_cp)
+                clips_open.append(src)
+                c = src.subclip(0, min(scene_dur, src.duration))
+                c = c.resize(height=FRAME_H)
+                if c.w < FRAME_W:
+                    c = c.resize(width=FRAME_W)
+                c = c.crop(x_center=c.w / 2, y_center=c.h / 2, width=FRAME_W, height=FRAME_H)
+                seg_clips.append(c.set_duration(scene_dur))
+            except Exception:
+                seg_clips.append(ColorClip(size=(FRAME_W, FRAME_H), color=style["bg"],
+                                           duration=scene_dur))
 
         if not seg_clips:
             seg_clips = [ColorClip(size=(FRAME_W, FRAME_H), color=style["bg"], duration=5.0)]
 
         base = concatenate_videoclips(seg_clips, method="compose")
 
-        # ASS caption overlay (centre-aligned, no static title)
-        caption_events = _load_caption_events()
-        if caption_events:
-            caption_layers = [base]
-            for idx, (start, end, text) in enumerate(caption_events):
-                card_path = _render_caption_card(text, idx)
-                caption_layers.append(
-                    ImageClip(card_path)
-                    .set_start(start)
-                    .set_duration(max(0.4, end - start))
-                    .set_position(("center", "center"))
-                )
-            base = CompositeVideoClip(caption_layers, size=(FRAME_W, FRAME_H)).set_duration(base.duration)
-
-        # Audio
         audio_layers = []
         if vc:
-            if vc.duration > base.duration:
-                vc = vc.subclip(0, base.duration)
             audio_layers.append(vc.set_start(0))
-        music_file = _pick_music()
-        if music_file:
-            try:
-                mc = AudioFileClip(music_file)
-                if mc.duration < base.duration:
-                    mc = afx.audio_loop(mc, duration=base.duration)
-                else:
-                    mc = mc.subclip(0, base.duration)
-                audio_layers.append(mc.volumex(MUSIC_VOLUME).set_start(0))
-            except Exception:
-                pass
         if audio_layers:
             base = base.set_audio(CompositeAudioClip(audio_layers))
 
@@ -748,20 +570,15 @@ def _moviepy_fallback(
             fps=FPS,
             codec="libx264",
             audio_codec="aac",
-            preset="ultrafast",
+            preset="medium",
             threads=4,
             logger=None,
         )
         for c in clips_open:
             c.close()
-        for asset in overlay_assets:
-            try:
-                asset.unlink(missing_ok=True)
-            except Exception:
-                pass
         return True
     except Exception as exc:
-        _log(log_handler, f"MoviePy fallback also failed: {exc}")
+        _log(log_handler, f"[Render] MoviePy fallback failed: {exc}")
         return False
 
 
@@ -774,81 +591,77 @@ def create_reel_video(
     audio_path: str,
     script_text: str,
     ass_path: str | None = None,
-    srt_path: str | None = None,
+    srt_path: str | None = None,    # accepted but ignored — always ASS in local mode
     log_handler=None,
     hook_text: str | None = None,
 ) -> str:
     """
-    Render the final reel MP4 — memory-safe path for Render free tier.
+    Render the final high-quality reel MP4.
 
-    Strategy
-    ────────
-    1. FFmpeg low-memory path (sequential segments → concat demuxer)
-       Peak RAM: ~80-160 MB. Target: sub-400 MB total process.
-       Subtitles burned in during the existing Phase 2 re-encode pass —
-       no extra pass, no extra memory cost.
-    2. MoviePy fallback only if FFmpeg is not on PATH.
+    Returns the absolute path to the output file.
 
-    FREE_PLAN=true  : 480×854, veryfast, 700k, SRT subtitles
-    FREE_PLAN=false : 720×1280, ultrafast, 1M, ASS subtitles (default)
+    Strategy:
+    1. FFmpeg two-phase render (segments → concat + ASS burn) — primary
+    2. MoviePy fallback — only if FFmpeg is not installed
     """
-    import gc
-    from utils.memory_guard import log_ram
-
     ensure_storage_dirs()
 
-    # Enforce scene limit before touching FFmpeg — each extra clip costs RAM
     working_clips = [p for p in clip_paths[:_SCENE_LIMIT]
-                     if (BASE_DIR / Path(p)).exists()]
+                     if (Path(p).is_absolute() and Path(p).exists())
+                     or (BASE_DIR / Path(p)).exists()]
 
-    file_name = f"reel_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.mp4"
+    timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    file_name = f"reel_{timestamp}.mp4"
     output_path = str(REELS_DIR / file_name)
 
-    _ATEMPO   = 1.25
-    _DELAY_S  = 0.50
-    _BUFFER_S = 0.30
-
-    total_duration = max(len(working_clips) * 3.0, 8.0)
-    probed = _get_media_duration(str(BASE_DIR / Path(audio_path)))
+    # Total duration = audio duration + 0.5s hook delay
+    _DELAY_S = 0.50
+    total_duration = max(len(working_clips) * 3.5, 10.0)
+    probed = _get_media_duration(
+        str(BASE_DIR / Path(audio_path)) if not Path(audio_path).is_absolute()
+        else audio_path
+    )
     if probed > 0:
-        total_duration = (probed / _ATEMPO) + _DELAY_S + _BUFFER_S
+        total_duration = probed + _DELAY_S + 0.3
 
-    plan_label = "FREE_PLAN 480p/veryfast/700k" if _FREE_PLAN else "720p/ultrafast/1M"
-    sub_label  = "ASS" if ass_path else ("SRT" if srt_path else "no captions")
-    log_ram("Before FFmpeg render", log_handler)
+    res_label = f"{FRAME_W}×{FRAME_H}"
+    _log(log_handler, (
+        f"[Render] LOCAL MODE — {res_label} / {FPS}fps / CRF{_CRF} / {_PRESET} / "
+        f"{_VIDEO_BRATE} / {len(working_clips)} scenes / "
+        f"{'ASS captions' if ass_path else 'no captions'}"
+    ))
 
     if _ffmpeg_available():
-        _log(log_handler,
-             f"[Render] {plan_label} / {len(working_clips)} scenes / {sub_label} subtitles")
-        success = _ffmpeg_render_low_mem(
+        success = _ffmpeg_render(
             clip_paths=working_clips,
             audio_path=audio_path,
             output_path=output_path,
             total_duration=total_duration,
             ass_path=ass_path,
-            srt_path=srt_path,
             log_handler=log_handler,
         )
-        gc.collect()
-        log_ram("After FFmpeg render", log_handler)
-        if success:
-            _log(log_handler, "Video rendered [FFmpeg low-mem]")
-            return to_storage_relative(Path(output_path))
-        _log(log_handler, "FFmpeg render failed → trying MoviePy")
+        if success and Path(output_path).exists():
+            size_mb = Path(output_path).stat().st_size / 1_048_576
+            _log(log_handler, f"[Render] Done → {output_path} ({size_mb:.1f} MB)")
+            return output_path
+        _log(log_handler, "[Render] FFmpeg failed — trying MoviePy")
     else:
-        _log(log_handler, "FFmpeg not on PATH → MoviePy fallback")
+        _log(log_handler, "[Render] FFmpeg not found — trying MoviePy")
 
     ok = _moviepy_fallback(
         clip_paths=working_clips,
         audio_path=audio_path,
         script_text=script_text,
-        ass_path=None,          # subtitles disabled to save memory
+        ass_path=ass_path,
         output_path=output_path,
         style=random.choice(STYLES),
         log_handler=log_handler,
     )
     if ok:
-        _log(log_handler, "Video rendered [MoviePy fallback]")
-        return to_storage_relative(Path(output_path))
+        _log(log_handler, f"[Render] Done (MoviePy) → {output_path}")
+        return output_path
 
-    raise RuntimeError("Both FFmpeg and MoviePy renderers failed. Check logs.")
+    raise RuntimeError(
+        "Both FFmpeg and MoviePy renderers failed. "
+        "Ensure FFmpeg is installed: winget install Gyan.FFmpeg"
+    )
