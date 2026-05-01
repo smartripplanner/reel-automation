@@ -202,14 +202,34 @@ def get_job(job_id: str) -> dict | None:
     """
     Return job dict or None.
 
-    Memory cache first (full logs, fast).  Falls back to DB when the job
-    was created by a previous process or a worker subprocess.
+    Always reads from DB for non-terminal jobs so that worker subprocess
+    updates (set_running, set_completed, set_failed) are immediately visible
+    to the FastAPI server process, which has a separate in-memory dict.
+
+    In-memory cache is only trusted for terminal states (completed/failed)
+    where no further updates are expected.
     """
+    _TERMINAL = ("completed", "failed")
+
     with _lock:
-        job = _jobs.get(job_id)
-    if job is not None:
-        return job
-    return _db_read(job_id)
+        cached = _jobs.get(job_id)
+
+    # For terminal states served from memory, return immediately (fast path)
+    if cached is not None and cached.get("status") in _TERMINAL:
+        return cached
+
+    # For running/queued (or no cache), always read DB — worker subprocess
+    # writes there and the server process cannot see the worker's memory.
+    db_job = _db_read(job_id)
+    if db_job is not None:
+        # Promote terminal state into memory cache so future reads are fast
+        if db_job.get("status") in _TERMINAL:
+            with _lock:
+                _jobs[job_id] = db_job
+        return db_job
+
+    # Final fallback: return cached (may be stale but better than None)
+    return cached
 
 
 def append_log(job_id: str, message: str) -> None:

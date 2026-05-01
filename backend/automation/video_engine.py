@@ -437,12 +437,13 @@ def _ffmpeg_render(
                 fh.write(f"file '{seg.replace(chr(92), '/')}'\n")
 
         # ── Phase 2: audio chain ───────────────────────────────────────────────
-        # atempo=1.0 — no speed-up in local mode (full natural pace)
+        # atempo=1.15 — 15% pitch-preserving speed-up for snappy reel pacing
         # adelay=500ms — half-second hook pause before voice starts
         afmt = "aformat=sample_rates=44100:channel_layouts=stereo"
         audio_chain = (
             f"[1:a]{afmt},volume=1.0,"
             f"adelay=500|500,"
+            f"atempo=1.15,"
             f"apad[final_a]"
         )
 

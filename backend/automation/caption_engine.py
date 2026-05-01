@@ -57,7 +57,7 @@ class CaptionStyle:
     outline_size: int = 2            # clean 2px outline — crisp without looking clunky
     shadow_depth: int = 1
     alignment: int = 2               # bottom-center (ASS numpad layout: 2=bottom-center)
-    margin_v: int = 120              # distance from bottom edge — safe zone
+    margin_v: int = 200              # distance from bottom edge — lower-third safe zone
     margin_lr: int = 40              # left/right safe margins
 
 
@@ -75,8 +75,8 @@ class CaptionStyle:
 #
 # Combined correction: corrected = (original / voice_speed) + voice_delay_s
 
-_AUDIO_SPEED   = 1.0    # local mode: no speed-up (natural pace)
-_AUDIO_DELAY_S = 0.50   # adelay=500ms in video_engine.py — hook pause before voice
+_AUDIO_SPEED   = 1.15   # must match atempo=1.15 in video_engine.py audio_chain
+_AUDIO_DELAY_S = 0.50   # must match adelay=500ms in video_engine.py audio_chain
 
 
 # ─────────────────────────────────────────────────────────────────────────────
